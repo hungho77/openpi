@@ -804,6 +804,35 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+    #
+    # SO101 single-arm multitask (hungho77/so101-multitask), PyTorch finetune.
+    #
+    # Modelled on pi05_aloha_pen_uncap, which is openpi's own example of finetuning
+    # pi05_base on a small custom LeRobot dataset. Everything not listed here is left at
+    # the TrainConfig / Pi0Config / CosineDecaySchedule / AdamW defaults on purpose.
+    TrainConfig(
+        name="pi05_so101",
+        # Default action_horizon (50), like pi05_aloha_pen_uncap. pi05_base was pretrained
+        # at this horizon; only pi05_libero overrides it, to match LIBERO's short chunks.
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSO101DataConfig(
+            # The Hub copy is LeRobot v3.0, but openpi pins lerobot from 2025-05-28 which
+            # only reads v2.1. Point HF_LEROBOT_HOME at the converted v2.1 tree so this
+            # repo_id resolves locally:
+            #   HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_multitask_v21
+            repo_id="hungho77/so101-multitask",
+            # prompt_from_task turns the dataset's task_index into the language prompt,
+            # which is what makes this one checkpoint cover all three tasks.
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_train_steps=6_000,
+        # EMA is listed as unsupported by the PyTorch trainer, so it has to be off here
+        # even though the openpi default is 0.99. This is the one forced deviation.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+    ),
     TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
