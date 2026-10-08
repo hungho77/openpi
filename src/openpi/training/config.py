@@ -833,6 +833,45 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
     ),
+    #
+    # SO101 LEFT arm, 11-task multitask (hungho77/SO101_LeftArmOnly_Task collection merged).
+    #
+    # Same robot layout as pi05_so101 above — 5 arm joints + gripper, cameras `top` and
+    # `wrist` — so LeRobotSO101DataConfig and so101_policy are reused unchanged. What
+    # differs is scale: 551 episodes and 253,745 frames across 11 tasks, 3.8x the
+    # right-arm set, which is why the step count and LR schedule below are not simply
+    # copied from it.
+    TrainConfig(
+        name="pi05_so101_leftarm_multitask",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSO101DataConfig(
+            # Resolved under HF_LEROBOT_HOME, which must point at the merged v2.1 tree:
+            #   HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_multitask_v21
+            repo_id="hungho77/so101-left-arm-multitask",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # 32 is the ceiling, measured, not chosen: this trains under DDP on two MIG
+        # 3g.40gb slices, DDP replicates the optimizer on every rank (openpi's PyTorch
+        # trainer has no FSDP), and the fixed cost of weights + grads + AdamW state is
+        # ~29GB of the 39.5GB slice. Measured reserved memory: bs 32 -> 35.3GB,
+        # bs 48 -> 38.4GB, bs 64 -> OOM. There is also no gradient accumulation in the
+        # PyTorch trainer, so this is the effective batch, not a per-device one.
+        # openpi's own pi05_droid_finetune runs at 32 as well.
+        batch_size=32,
+        # 24_000 x 32 = 768_000 samples, the same sample budget as the right-arm run
+        # (6_000 x 128), which keeps the two checkpoints comparable. In epochs it is only
+        # 3.0 against that run's 11.4, because this dataset is 3.8x larger.
+        num_train_steps=24_000,
+        # decay_steps tied to num_train_steps, unlike the default 30_000. On the right-arm
+        # run that default against 6_000 steps left the LR at 94% of peak the whole way —
+        # the cosine never actually decayed, and the loss was still falling when training
+        # stopped. Overriding the schedule is how other configs in this file handle it.
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=24_000),
+        # EMA is unsupported by the PyTorch trainer.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+    ),
     TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
