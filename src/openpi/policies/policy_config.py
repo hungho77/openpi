@@ -72,13 +72,26 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    metadata_transforms = []
+    uncond_transforms = []
+    if (episode_metadata := data_config.episode_metadata) is not None:
+        metadata_transforms = episode_metadata.inference_transforms()
+        if episode_metadata.cfg_scale != 1.0:
+            if is_pytorch or train_config.model.model_type == _model.ModelType.PI0_FAST:
+                logging.warning("Classifier-free guidance is only supported for JAX pi0 models, ignoring cfg_scale.")
+            else:
+                uncond_transforms = [transforms.UnconditionalPrompt()]
+                sample_kwargs = {"cfg_scale": episode_metadata.cfg_scale, **(sample_kwargs or {})}
+
     return _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
+            *metadata_transforms,
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *uncond_transforms,
             *data_config.model_transforms.inputs,
         ],
         output_transforms=[

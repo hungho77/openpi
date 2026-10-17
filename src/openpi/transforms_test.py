@@ -119,3 +119,71 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_format_and_strip_metadata_prompt():
+    prompt = _transforms.format_metadata_prompt(
+        "peel vegetables.", subtask="pick up the peeler", speed=8000, quality=5, mistake=False
+    )
+    assert prompt == "peel vegetables. Subtask: pick up the peeler. Speed: 8000. Quality: 5. Mistake: false"
+    assert _transforms.strip_metadata_prompt(prompt) == "peel vegetables. Subtask: pick up the peeler"
+
+    prompt = _transforms.format_metadata_prompt("fold the shirt", quality=3, mistake=True)
+    assert prompt == "fold the shirt. Quality: 3. Mistake: true"
+    assert _transforms.strip_metadata_prompt(prompt) == "fold the shirt"
+    assert _transforms.format_metadata_prompt("fold the shirt") == "fold the shirt"
+
+
+def test_bin_episode_speed():
+    assert _transforms.bin_episode_speed(1750, 500) == 2000
+    assert _transforms.bin_episode_speed(2249, 500) == 2000
+    assert _transforms.bin_episode_speed(100, 500) == 500
+
+
+def test_episode_metadata_prompt():
+    episodes = {
+        0: {"length": 1900, "quality": 4, "segments": ((0, 10, "pick up the cup", None), (10, 20, "place it", True))},
+        1: {"length": 600},
+    }
+    transform = _transforms.EpisodeMetadataPrompt(episodes, metadata_dropout=0.0, field_dropout=0.0)
+
+    data = transform({"prompt": "clean up", "episode_index": 0, "frame_index": 5})
+    assert data["prompt"] == "clean up. Subtask: pick up the cup. Speed: 2000. Quality: 4. Mistake: false"
+    data = transform({"prompt": "clean up", "episode_index": 0, "frame_index": 15})
+    assert data["prompt"] == "clean up. Subtask: place it. Speed: 2000. Quality: 4. Mistake: true"
+    data = transform({"prompt": np.asarray("clean up"), "episode_index": np.asarray(1), "frame_index": 0})
+    assert data["prompt"] == "clean up. Speed: 500"
+
+    transform = _transforms.EpisodeMetadataPrompt(episodes, metadata_dropout=1.0, subtask_dropout=1.0)
+    data = transform({"prompt": "clean up", "episode_index": 0, "frame_index": 5})
+    assert data["prompt"] == "clean up"
+
+
+def test_episode_metadata_prompt_dropout_rate():
+    episodes = {0: {"length": 1000, "quality": 5, "mistake": False}}
+    transform = _transforms.EpisodeMetadataPrompt(episodes, metadata_dropout=0.3, field_dropout=0.0, seed=0)
+    prompts = [transform({"prompt": "task", "episode_index": 0, "frame_index": 0})["prompt"] for _ in range(2000)]
+    assert 0.25 < np.mean([p == "task" for p in prompts]) < 0.35
+
+
+def test_inject_metadata_prompt():
+    transform = _transforms.InjectMetadataPrompt(speed=1900)
+    assert transform({"prompt": "clean up"})["prompt"] == "clean up. Speed: 2000. Quality: 5. Mistake: false"
+
+    data = transform({"prompt": "clean up", "subtask": np.asarray("open the fridge"), "quality": 3})
+    assert data == {"prompt": "clean up. Subtask: open the fridge. Speed: 2000. Quality: 3. Mistake: false"}
+
+    # The override keys are always removed.
+    assert transform({"speed": 100}) == {}
+
+
+def test_tokenize_prompt_uncond():
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len=24)
+    data = {"prompt": "clean up. Quality: 5. Mistake: false"}
+    data = _transforms.UnconditionalPrompt()(data)
+    assert data["prompt_uncond"] == "clean up"
+
+    data = _transforms.TokenizePrompt(tokenizer)(data)
+    tok_prompt, _ = tokenizer.tokenize("clean up")
+    assert "prompt_uncond" not in data
+    assert np.array_equal(tok_prompt, data["tokenized_prompt_uncond"])

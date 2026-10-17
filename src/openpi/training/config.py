@@ -23,6 +23,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.episode_metadata as _episode_metadata
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
@@ -89,6 +90,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # If set, the prompt will be extended with the episode metadata (speed, quality, mistake) and the current subtask.
+    # Only supported for LeRobot datasets. The repack transforms must keep the "prompt" key.
+    episode_metadata: _episode_metadata.EpisodeMetadataConfig | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -759,6 +763,39 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # Example of episode metadata prompting. The prompt is extended with the episode speed (and quality / mistake /
+    # subtask labels if an annotations file is provided). Use `scripts/compute_episode_metadata.py` to get the episode
+    # length statistics and an annotations template for your dataset.
+    TrainConfig(
+        name="pi05_libero_metadata",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    annotations_path=None,
+                    # LIBERO runs at 10 Hz with episodes of a few hundred steps, so a smaller bin size is used.
+                    speed_bin_size=25,
+                    # Pick from the output of `scripts/compute_episode_metadata.py` (e.g. the 15th percentile).
+                    target_speed=100,
+                    cfg_scale=1.0,
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
     #

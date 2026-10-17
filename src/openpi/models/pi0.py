@@ -63,6 +63,21 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def _stack_cfg_observation(obs: _model.Observation) -> _model.Observation:
+    """Stacks the conditional and the unconditional prompt along the batch dimension."""
+
+    def stack(x):
+        return jnp.concatenate([x, x], axis=0)
+
+    return _model.Observation(
+        images={k: stack(v) for k, v in obs.images.items()},
+        image_masks={k: stack(v) for k, v in obs.image_masks.items()},
+        state=stack(obs.state),
+        tokenized_prompt=jnp.concatenate([obs.tokenized_prompt, obs.tokenized_prompt_uncond], axis=0),
+        tokenized_prompt_mask=jnp.concatenate([obs.tokenized_prompt_mask, obs.tokenized_prompt_uncond_mask], axis=0),
+    )
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -221,6 +236,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        cfg_scale: float | at.Float[at.Array, ""] = 1.0,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -230,16 +246,25 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
+        # classifier-free guidance: the conditional and unconditional prompts are run as a single batch of size 2b,
+        # and the velocities are combined as v_uncond + cfg_scale * (v_cond - v_uncond).
+        use_cfg = observation.tokenized_prompt_uncond is not None
+        if use_cfg:
+            observation = _stack_cfg_observation(observation)
+
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        model_batch_size = observation.state.shape[0]
+
         def step(carry):
             x_t, time = carry
+            x_in = jnp.concatenate([x_t, x_t], axis=0) if use_cfg else x_t
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_in, jnp.broadcast_to(time, model_batch_size)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -251,7 +276,7 @@ class Pi0(_model.BaseModel):
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
-                batch_size,
+                model_batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
@@ -267,6 +292,9 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            if use_cfg:
+                v_cond, v_uncond = jnp.split(v_t, 2, axis=0)
+                v_t = v_uncond + cfg_scale * (v_cond - v_uncond)
 
             return x_t + dt * v_t, time + dt
 

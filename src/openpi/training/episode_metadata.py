@@ -1,0 +1,137 @@
+"""Episode metadata prompting.
+
+The prompt of every training example is extended with information about how the episode was performed: its speed
+(episode length), quality score, whether the robot made a mistake, and optionally the current subtask. This makes it
+possible to train on mixed quality data (failures, autonomous rollouts, slow demonstrations) and then prompt the model
+for fast, high quality, mistake free behavior at inference time.
+
+Annotations are stored in a JSON file, keyed by episode index:
+
+```
+{
+    "0": {"quality": 5},
+    "1": {"quality": 2, "mistake": true},
+    "2": {
+        "quality": 4,
+        "segments": [
+            {"start": 0, "end": 150, "subtask": "pick up the cup"},
+            {"start": 150, "end": 260, "subtask": "place the cup in the sink", "mistake": true}
+        ]
+    }
+}
+```
+
+All fields are optional. The episode speed is always computed from the episode length in the dataset. Segment frame
+ranges are `[start, end)` in terms of the dataset "frame_index". See `scripts/compute_episode_metadata.py` to create a
+template for a dataset.
+"""
+
+from collections.abc import Mapping
+import dataclasses
+import json
+import logging
+import pathlib
+
+import etils.epath as epath
+import numpy as np
+
+import openpi.transforms as _transforms
+
+logger = logging.getLogger("openpi")
+
+
+@dataclasses.dataclass(frozen=True)
+class EpisodeMetadataConfig:
+    # Path to the JSON annotations file. If None, only the episode speed is used.
+    annotations_path: str | None = None
+    # Episode lengths are rounded to the nearest multiple of this value (in steps).
+    speed_bin_size: int = 500
+
+    # Training: probability of dropping all of the metadata from the prompt.
+    metadata_dropout: float = 0.15
+    # Training: probability of dropping each metadata field individually.
+    field_dropout: float = 0.05
+    # Training: probability of dropping the subtask from the prompt.
+    subtask_dropout: float = 0.0
+
+    # Inference: desired episode length in steps. A good choice is the 15th percentile of the episode lengths of the
+    # task (see `scripts/compute_episode_metadata.py`). If None, the speed is left out of the prompt.
+    target_speed: int | None = None
+    # Inference: desired quality score.
+    target_quality: int | None = 5
+    # Inference: desired mistake label.
+    target_mistake: bool | None = False
+    # Inference: classifier-free guidance scale on the metadata. Each denoising step uses
+    # v = v_uncond + cfg_scale * (v_cond - v_uncond), where the unconditional prompt has no metadata. 1.0 disables
+    # guidance; values around 1.5-2.5 work well in practice. Requires the model to be trained with metadata dropout.
+    cfg_scale: float = 1.0
+
+    def inference_transforms(self) -> list[_transforms.DataTransformFn]:
+        """Transforms that add the desired metadata to the prompt. Applied before the data transforms."""
+        return [
+            _transforms.InjectMetadataPrompt(
+                speed=self.target_speed,
+                quality=self.target_quality,
+                mistake=self.target_mistake,
+                speed_bin_size=self.speed_bin_size,
+            )
+        ]
+
+
+def load_annotations(path: str | pathlib.Path) -> dict[int, dict]:
+    """Loads the annotations file and converts it to the format expected by `EpisodeMetadataPrompt`."""
+    with epath.Path(path).open() as f:
+        raw = json.load(f)
+
+    episodes = {}
+    for key, value in raw.items():
+        episode = {}
+        if (quality := value.get("quality")) is not None:
+            episode["quality"] = int(quality)
+        if (mistake := value.get("mistake")) is not None:
+            episode["mistake"] = bool(mistake)
+        if (segments := value.get("segments")) is not None:
+            episode["segments"] = tuple(
+                (
+                    int(segment["start"]),
+                    int(segment["end"]),
+                    segment.get("subtask"),
+                    None if segment.get("mistake") is None else bool(segment["mistake"]),
+                )
+                for segment in segments
+            )
+        episodes[int(key)] = episode
+    return episodes
+
+
+def get_episode_lengths(dataset_meta) -> dict[int, int]:
+    """Returns the episode lengths from a `LeRobotDatasetMetadata`."""
+    return {int(index): int(episode["length"]) for index, episode in dataset_meta.episodes.items()}
+
+
+def build_episode_table(config: EpisodeMetadataConfig, episode_lengths: Mapping[int, int]) -> dict[int, dict]:
+    """Merges the episode lengths with the annotations."""
+    annotations = load_annotations(config.annotations_path) if config.annotations_path is not None else {}
+    unknown = set(annotations) - set(episode_lengths)
+    if unknown:
+        logger.warning(f"Annotations found for {len(unknown)} episodes that are not in the dataset, ignoring them.")
+
+    table = {index: {"length": length, **annotations.get(index, {})} for index, length in episode_lengths.items()}
+    num_annotated = sum(index in annotations for index in episode_lengths)
+    logger.info(f"Episode metadata: {num_annotated}/{len(table)} episodes have annotations.")
+    return table
+
+
+def create_training_transform(config: EpisodeMetadataConfig, dataset_meta) -> _transforms.EpisodeMetadataPrompt:
+    return _transforms.EpisodeMetadataPrompt(
+        episodes=build_episode_table(config, get_episode_lengths(dataset_meta)),
+        speed_bin_size=config.speed_bin_size,
+        metadata_dropout=config.metadata_dropout,
+        field_dropout=config.field_dropout,
+        subtask_dropout=config.subtask_dropout,
+    )
+
+
+def speed_percentiles(episode_lengths: Mapping[int, int], percentiles=(10, 15, 25, 50, 75, 90)) -> dict[int, int]:
+    lengths = np.asarray(list(episode_lengths.values()))
+    return {p: int(np.percentile(lengths, p)) for p in percentiles}

@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import random
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -263,7 +264,15 @@ class TokenizePrompt(DataTransformFn):
             prompt = prompt.item()
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
-        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        data = {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+        # Optional unconditional prompt, used for classifier-free guidance at inference time.
+        if (prompt_uncond := data.pop("prompt_uncond", None)) is not None:
+            if not isinstance(prompt_uncond, str):
+                prompt_uncond = prompt_uncond.item()
+            tokens, token_masks = self.tokenizer.tokenize(prompt_uncond, state)
+            data = {**data, "tokenized_prompt_uncond": tokens, "tokenized_prompt_uncond_mask": token_masks}
+        return data
 
 
 @dataclasses.dataclass(frozen=True)
@@ -322,6 +331,168 @@ class PromptFromLeRobotTask(DataTransformFn):
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 
         return {**data, "prompt": prompt}
+
+
+# Fields that make up the episode metadata part of the prompt, in the order they appear.
+_METADATA_FIELDS = ("Speed", "Quality", "Mistake")
+_METADATA_PATTERN = re.compile(r"\.\s*(?:" + "|".join(_METADATA_FIELDS) + r"): [^.,]*")
+
+
+def bin_episode_speed(length: int, bin_size: int) -> int:
+    """Rounds an episode length (in steps) to the nearest multiple of `bin_size`, e.g. 1750-2249 -> 2000."""
+    return max(bin_size, round(length / bin_size) * bin_size)
+
+
+def format_metadata_prompt(
+    task: str,
+    *,
+    subtask: str | None = None,
+    speed: int | None = None,
+    quality: int | None = None,
+    mistake: bool | None = None,
+) -> str:
+    """Builds a prompt that contains the task, the current subtask and the episode metadata.
+
+    Example: "peel vegetables. Subtask: pick up the peeler. Speed: 8000. Quality: 5. Mistake: false"
+
+    Fields that are None are left out of the prompt.
+    """
+    parts = [task.strip().rstrip(".")]
+    if subtask:
+        parts.append(f"Subtask: {subtask.strip().rstrip('.')}")
+    if speed is not None:
+        parts.append(f"Speed: {int(speed)}")
+    if quality is not None:
+        parts.append(f"Quality: {int(quality)}")
+    if mistake is not None:
+        parts.append(f"Mistake: {'true' if mistake else 'false'}")
+    return ". ".join(parts)
+
+
+def strip_metadata_prompt(prompt: str) -> str:
+    """Removes the episode metadata from a prompt built by `format_metadata_prompt`, keeping task and subtask."""
+    return _METADATA_PATTERN.sub("", prompt)
+
+
+def _to_python(value):
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class EpisodeMetadataPrompt(DataTransformFn):
+    """Adds episode metadata (speed, quality, mistake) and the current subtask to the prompt during training.
+
+    This must be applied to the raw dataset samples since it relies on "episode_index" and "frame_index". Each part
+    of the metadata is randomly dropped so that the model can be prompted with any subset of it at inference time.
+    """
+
+    # Maps episode index to its annotations. Supported keys:
+    #   "length": int, the episode length in steps (used for the speed).
+    #   "quality": int, the quality score of the episode (e.g. 1-5).
+    #   "mistake": bool, episode level mistake label.
+    #   "segments": list of (start_frame, end_frame, subtask, mistake) tuples. `subtask` and `mistake` may be None.
+    #     Frames inside a segment use the segment labels. If segments are provided, frames that are not covered by a
+    #     segment with a mistake label fall back to the episode level label, or to "no mistake".
+    episodes: Mapping[int, Mapping]
+    speed_bin_size: int = 500
+    # Probability of dropping all of the metadata.
+    metadata_dropout: float = 0.15
+    # Probability of dropping each metadata field individually.
+    field_dropout: float = 0.05
+    # Probability of dropping the subtask.
+    subtask_dropout: float = 0.0
+    # If None, the global `random` module is used, which is seeded separately in each data loader worker.
+    seed: int | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "_rng", random.Random(self.seed) if self.seed is not None else None)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "prompt" not in data:
+            raise ValueError("A prompt is required to add the episode metadata.")
+        if "episode_index" not in data or "frame_index" not in data:
+            raise ValueError('Cannot add the episode metadata without "episode_index" and "frame_index".')
+
+        episode = self.episodes.get(int(data["episode_index"]), {})
+        frame = int(data["frame_index"])
+
+        speed = episode.get("length")
+        if speed is not None:
+            speed = bin_episode_speed(speed, self.speed_bin_size)
+        quality = episode.get("quality")
+        mistake = episode.get("mistake")
+        subtask = None
+        if (segments := episode.get("segments")) is not None:
+            if mistake is None:
+                mistake = False
+            for start, end, segment_subtask, segment_mistake in segments:
+                if start <= frame < end:
+                    subtask = segment_subtask
+                    if segment_mistake is not None:
+                        mistake = segment_mistake
+                    break
+
+        rand = self._rng.random if self._rng is not None else random.random  # type: ignore[attr-defined]
+        if rand() < self.metadata_dropout:
+            speed = quality = mistake = None
+        else:
+            speed = None if rand() < self.field_dropout else speed
+            quality = None if rand() < self.field_dropout else quality
+            mistake = None if rand() < self.field_dropout else mistake
+        if rand() < self.subtask_dropout:
+            subtask = None
+
+        prompt = format_metadata_prompt(
+            str(_to_python(data["prompt"])), subtask=subtask, speed=speed, quality=quality, mistake=mistake
+        )
+        return {**data, "prompt": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectMetadataPrompt(DataTransformFn):
+    """Adds the desired episode metadata to the prompt at inference time.
+
+    The defaults can be overridden per request by passing "subtask", "speed", "quality" or "mistake" in the
+    observation.
+    """
+
+    # Desired episode length in steps. A good choice is a low percentile (e.g. 15th) of the episode lengths of the
+    # task in the training data. If None, the speed is left out of the prompt.
+    speed: int | None = None
+    quality: int | None = 5
+    mistake: bool | None = False
+    speed_bin_size: int = 500
+
+    def __call__(self, data: DataDict) -> DataDict:
+        subtask = _to_python(data.pop("subtask", None))
+        speed = _to_python(data.pop("speed", self.speed))
+        quality = _to_python(data.pop("quality", self.quality))
+        mistake = _to_python(data.pop("mistake", self.mistake))
+        if "prompt" not in data:
+            return data
+
+        if speed is not None:
+            speed = bin_episode_speed(int(speed), self.speed_bin_size)
+        if isinstance(mistake, str):
+            mistake = mistake.lower() == "true"
+        prompt = format_metadata_prompt(
+            str(_to_python(data["prompt"])), subtask=subtask, speed=speed, quality=quality, mistake=mistake
+        )
+        return {**data, "prompt": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class UnconditionalPrompt(DataTransformFn):
+    """Adds a copy of the prompt without the episode metadata, used for classifier-free guidance."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "prompt" not in data:
+            return data
+        return {**data, "prompt_uncond": strip_metadata_prompt(str(_to_python(data["prompt"])))}
 
 
 @dataclasses.dataclass(frozen=True)

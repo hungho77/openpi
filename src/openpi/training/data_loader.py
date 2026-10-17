@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.episode_metadata as _episode_metadata
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -148,6 +149,11 @@ def create_torch_dataset(
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
+    if data_config.episode_metadata is not None:
+        dataset = TransformedDataset(
+            dataset, [_episode_metadata.create_training_transform(data_config.episode_metadata, dataset_meta)]
+        )
+
     return dataset
 
 
@@ -243,6 +249,8 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if data_config.episode_metadata is not None:
+            raise ValueError("Episode metadata is only supported for LeRobot datasets.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
