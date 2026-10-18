@@ -1024,7 +1024,11 @@ _CONFIGS = [
             repo_id="hungho77/so101-left-arm-multitask",
             base_config=DataConfig(
                 prompt_from_task=True,
-                episode_metadata=_episode_metadata.EpisodeMetadataConfig(speed_bin_size=150),
+                # No annotations: the prompt only has the speed. The 15th percentile of the episode lengths is
+                # 289 steps (median 424).
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=50, target_speed=300, target_quality=None, target_mistake=None
+                ),
             ),
         ),
         batch_size=16,
@@ -1087,7 +1091,10 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episode_metadata=_episode_metadata.EpisodeMetadataConfig(
-                    speed_bin_size=150,
+                    speed_bin_size=50,
+                    target_speed=300,
+                    target_quality=None,
+                    target_mistake=None,
                     advantages_path="./assets/value_so101_left/advantages.npz",
                 ),
                 subgoal=_episode_metadata.SubgoalConfig(views=("base_0_rgb",)),
