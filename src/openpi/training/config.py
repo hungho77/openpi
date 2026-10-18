@@ -22,6 +22,7 @@ import openpi.models.value_model as value_model
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.so101_policy as so101_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -372,6 +373,45 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSO101DataConfig(DataConfigFactory):
+    """Single SO101 arm with a top and a wrist camera, recorded with LeRobot (absolute joint position actions)."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.top",
+                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[so101_policy.SO101Inputs(model_type=model_config.model_type)],
+            outputs=[so101_policy.SO101Outputs()],
+        )
+        # The 5 arm joints are trained as deltas, the gripper stays absolute.
+        delta_action_mask = _transforms.make_bool_mask(5, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -964,6 +1004,138 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    #
+    # SO101 left arm, 11 tasks (hungho77/so101-left-arm-multitask, 30 fps). Trained with PyTorch, see
+    # docs/pytorch_training.md. Set `pytorch_weight_path` to the converted pi05_base checkpoint.
+    #
+    TrainConfig(
+        name="pi05_so101_left",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            # Leaves room for the FAST tokens used by knowledge insulation.
+            max_token_len=250,
+            # 200 ms at 30 fps.
+            rtc_max_delay=6,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(speed_bin_size=150),
+            ),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=30_000,
+        save_interval=2_000,
+    ),
+    # RECAP, step 1: value function on the SO101 data. Episodes without a "success" label count as successful.
+    TrainConfig(
+        name="value_so101_left",
+        model=value_model.ValueConfig(),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                value_target=_episode_metadata.ValueTargetConfig(annotations_path=None, default_success=True),
+            ),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*value_head.*"
+        ),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=10_000,
+        save_interval=2_000,
+    ),
+    # RECAP, step 2, with memory and subgoal images: uses the advantages of `value_so101_left`.
+    TrainConfig(
+        name="pi05_so101_left_recap",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            max_token_len=250,
+            rtc_max_delay=6,
+            history_frames=2,
+            history_stride_s=1.0,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=150,
+                    advantages_path="./assets/value_so101_left/advantages.npz",
+                ),
+                subgoal=_episode_metadata.SubgoalConfig(views=("base_0_rgb",)),
+            ),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*lora.*|.*history_.*"
+        ),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=30_000,
+        save_interval=2_000,
+    ),
+    # High-level policy. Needs subtask segments in an annotations file (see docs/episode_metadata.md).
+    TrainConfig(
+        name="subtask_so101_left",
+        model=subtask_policy.SubtaskPolicyConfig(),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                subtask_targets=_episode_metadata.SubtaskTargetConfig(
+                    annotations_path="./assets/so101_left/annotations.json"
+                ),
+            ),
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-6,
+        ),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=10_000,
+        save_interval=2_000,
     ),
     #
     # Fine-tuning Aloha configs.
