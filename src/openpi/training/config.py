@@ -17,6 +17,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+import openpi.models.value_model as value_model
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
@@ -93,6 +94,9 @@ class DataConfig:
     # If set, the prompt will be extended with the episode metadata (speed, quality, mistake) and the current subtask.
     # Only supported for LeRobot datasets. The repack transforms must keep the "prompt" key.
     episode_metadata: _episode_metadata.EpisodeMetadataConfig | None = None
+    # If set, the normalized return is added to each example to train the RECAP value function. Only supported for
+    # LeRobot datasets.
+    value_target: _episode_metadata.ValueTargetConfig | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -127,8 +131,8 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
-            case _model.ModelType.PI05:
-                assert isinstance(model_config, pi0_config.Pi0Config)
+            case _model.ModelType.PI05 | _model.ModelType.VALUE:
+                assert isinstance(model_config, pi0_config.Pi0Config | value_model.ValueConfig)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -781,6 +785,65 @@ _CONFIGS = [
                     speed_bin_size=25,
                     # Pick from the output of `scripts/compute_episode_metadata.py` (e.g. the 15th percentile).
                     target_speed=100,
+                    cfg_scale=1.0,
+                ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # RECAP, step 1: value function. Trained on the returns of successful and failed episodes (see the "success"
+    # labels in the annotations file) and initialized from the pi05 backbone. Afterwards, run
+    # `scripts/compute_advantages.py` to label every frame with the advantage indicator.
+    TrainConfig(
+        name="value_libero",
+        model=value_model.ValueConfig(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                value_target=_episode_metadata.ValueTargetConfig(annotations_path=None),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*value_head.*"
+        ),
+        num_train_steps=20_000,
+    ),
+    # RECAP, step 2: policy trained with the advantage indicator in the prompt. Use the advantages computed with the
+    # value function above, and prompt the policy with "Advantage: positive" at inference time.
+    TrainConfig(
+        name="pi05_libero_recap",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    annotations_path=None,
+                    speed_bin_size=25,
+                    target_speed=100,
+                    advantages_path="./assets/value_libero/advantages.npz",
                     cfg_scale=1.0,
                 ),
             ),

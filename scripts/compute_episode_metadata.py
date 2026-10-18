@@ -38,7 +38,12 @@ def main(repo_id: str, *, output: str | None = None, overwrite: bool = False, sp
             raise FileExistsError(f"{output_path} already exists, use --overwrite to replace it.")
         # "length" and "tasks" are only informative and ignored when loading the annotations.
         template = {
-            str(index): {"length": lengths[int(index)], "tasks": episode.get("tasks", []), "quality": None}
+            str(index): {
+                "length": lengths[int(index)],
+                "tasks": episode.get("tasks", []),
+                "quality": None,
+                "success": None,
+            }
             for index, episode in sorted(dataset_meta.episodes.items())
         }
         output_path.write_text(json.dumps(template, indent=2))

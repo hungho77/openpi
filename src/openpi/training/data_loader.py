@@ -153,6 +153,10 @@ def create_torch_dataset(
         dataset = TransformedDataset(
             dataset, [_episode_metadata.create_training_transform(data_config.episode_metadata, dataset_meta)]
         )
+    if data_config.value_target is not None:
+        dataset = TransformedDataset(
+            dataset, [_episode_metadata.create_value_transform(data_config.value_target, dataset_meta)]
+        )
 
     return dataset
 
@@ -186,15 +190,16 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-    )
+    transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ]
+    if data_config.value_target is not None:
+        # The value target is added to the raw samples and would otherwise be removed by the repack transforms.
+        transforms = [_transforms.PassthroughKeys(_transforms.compose(transforms), keys=("value_target",))]
+    return TransformedDataset(dataset, transforms)
 
 
 def transform_iterable_dataset(
@@ -249,8 +254,8 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
-        if data_config.episode_metadata is not None:
-            raise ValueError("Episode metadata is only supported for LeRobot datasets.")
+        if data_config.episode_metadata is not None or data_config.value_target is not None:
+            raise ValueError("Episode metadata and value targets are only supported for LeRobot datasets.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,

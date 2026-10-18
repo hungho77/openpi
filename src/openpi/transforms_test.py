@@ -187,3 +187,38 @@ def test_tokenize_prompt_uncond():
     tok_prompt, _ = tokenizer.tokenize("clean up")
     assert "prompt_uncond" not in data
     assert np.array_equal(tok_prompt, data["tokenized_prompt_uncond"])
+
+
+def test_advantage_prompt():
+    prompt = _transforms.format_metadata_prompt("fold the shirt", quality=5, advantage=True)
+    assert prompt == "fold the shirt. Quality: 5. Advantage: positive"
+    assert _transforms.strip_metadata_prompt(prompt) == "fold the shirt"
+    assert _transforms.format_metadata_prompt("fold", advantage=False) == "fold. Advantage: negative"
+
+    advantages = np.array([True, False])
+    transform = _transforms.EpisodeMetadataPrompt(
+        {0: {"length": 2}}, metadata_dropout=0.0, field_dropout=0.0, advantages=advantages, advantage_dropout=0.0
+    )
+    data = transform({"prompt": "fold", "episode_index": 0, "frame_index": 1, "index": 1})
+    assert data["prompt"] == "fold. Speed: 500. Advantage: negative"
+
+    transform = _transforms.InjectMetadataPrompt(quality=None, mistake=None, advantage=True)
+    assert transform({"prompt": "fold"})["prompt"] == "fold. Advantage: positive"
+    assert transform({"prompt": "fold", "advantage": "negative"})["prompt"] == "fold. Advantage: negative"
+
+
+def test_value_target():
+    episodes = {
+        0: {"length": 11, "max_length": 20, "success": True},
+        1: {"length": 5, "max_length": 20, "success": False},
+    }
+    transform = _transforms.ValueTarget(episodes, failure_penalty=0.5)
+    assert transform({"episode_index": 0, "frame_index": 10})["value_target"] == 0.0
+    assert np.isclose(transform({"episode_index": 0, "frame_index": 0})["value_target"], -0.5)
+    assert np.isclose(transform({"episode_index": 1, "frame_index": 4})["value_target"], -0.5)
+    assert np.isclose(transform({"episode_index": 1, "frame_index": 0})["value_target"], -0.7)
+
+
+def test_passthrough_keys():
+    transform = _transforms.PassthroughKeys(_transforms.RepackTransform({"a": "a"}), keys=("value_target",))
+    assert transform({"a": 1, "b": 2, "value_target": 3}) == {"a": 1, "value_target": 3}

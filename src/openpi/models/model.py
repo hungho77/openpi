@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    VALUE = "value"
 
 
 # The model always expects these images
@@ -103,6 +104,9 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask for the unconditional prompt.
     tokenized_prompt_uncond_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Normalized return in [-1, 0], only used to train the value function.
+    value_target: at.Float[ArrayT, "*b"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -132,6 +136,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             tokenized_prompt_uncond=data.get("tokenized_prompt_uncond"),
             tokenized_prompt_uncond_mask=data.get("tokenized_prompt_uncond_mask"),
+            value_target=data.get("value_target"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -213,6 +218,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         tokenized_prompt_uncond=observation.tokenized_prompt_uncond,
         tokenized_prompt_uncond_mask=observation.tokenized_prompt_uncond_mask,
+        value_target=observation.value_target,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

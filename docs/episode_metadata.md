@@ -53,6 +53,7 @@ How the fields are read:
 - Segment ranges are `[start, end)` in terms of the dataset `frame_index`.
 - If an episode has segments, any frame without a segment-level mistake label uses the episode-level label. If the
   episode has no label either, the frame is treated as `Mistake: false`.
+- `success` (per episode) and `intervention` (per segment) are only used by RECAP. See [recap.md](recap.md).
 
 ## 2. Train
 

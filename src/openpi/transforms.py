@@ -334,7 +334,7 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 
 # Fields that make up the episode metadata part of the prompt, in the order they appear.
-_METADATA_FIELDS = ("Speed", "Quality", "Mistake")
+_METADATA_FIELDS = ("Speed", "Quality", "Mistake", "Advantage")
 _METADATA_PATTERN = re.compile(r"\.\s*(?:" + "|".join(_METADATA_FIELDS) + r"): [^.,]*")
 
 
@@ -350,10 +350,13 @@ def format_metadata_prompt(
     speed: int | None = None,
     quality: int | None = None,
     mistake: bool | None = None,
+    advantage: bool | None = None,
 ) -> str:
     """Builds a prompt that contains the task, the current subtask and the episode metadata.
 
     Example: "peel vegetables. Subtask: pick up the peeler. Speed: 8000. Quality: 5. Mistake: false"
+
+    `advantage` is the RECAP advantage indicator ("Advantage: positive" / "Advantage: negative").
 
     Fields that are None are left out of the prompt.
     """
@@ -366,6 +369,8 @@ def format_metadata_prompt(
         parts.append(f"Quality: {int(quality)}")
     if mistake is not None:
         parts.append(f"Mistake: {'true' if mistake else 'false'}")
+    if advantage is not None:
+        parts.append(f"Advantage: {'positive' if advantage else 'negative'}")
     return ". ".join(parts)
 
 
@@ -386,8 +391,9 @@ def _to_python(value):
 class EpisodeMetadataPrompt(DataTransformFn):
     """Adds episode metadata (speed, quality, mistake) and the current subtask to the prompt during training.
 
-    This must be applied to the raw dataset samples since it relies on "episode_index" and "frame_index". Each part
-    of the metadata is randomly dropped so that the model can be prompted with any subset of it at inference time.
+    This must be applied to the raw dataset samples since it relies on "episode_index", "frame_index" and, for the
+    advantage indicator, "index". Each part of the metadata is randomly dropped so that the model can be prompted with
+    any subset of it at inference time.
     """
 
     # Maps episode index to its annotations. Supported keys:
@@ -405,6 +411,10 @@ class EpisodeMetadataPrompt(DataTransformFn):
     field_dropout: float = 0.05
     # Probability of dropping the subtask.
     subtask_dropout: float = 0.0
+    # RECAP advantage indicator for each frame, indexed by the dataset "index". See `scripts/compute_advantages.py`.
+    advantages: np.ndarray | None = None
+    # Probability of dropping the advantage indicator. It is also dropped together with the rest of the metadata.
+    advantage_dropout: float = 0.3
     # If None, the global `random` module is used, which is seeded separately in each data loader worker.
     seed: int | None = None
 
@@ -435,19 +445,30 @@ class EpisodeMetadataPrompt(DataTransformFn):
                     if segment_mistake is not None:
                         mistake = segment_mistake
                     break
+        advantage = None
+        if self.advantages is not None:
+            if "index" not in data:
+                raise ValueError('Cannot add the advantage indicator without "index".')
+            advantage = bool(self.advantages[int(data["index"])])
 
         rand = self._rng.random if self._rng is not None else random.random  # type: ignore[attr-defined]
         if rand() < self.metadata_dropout:
-            speed = quality = mistake = None
+            speed = quality = mistake = advantage = None
         else:
             speed = None if rand() < self.field_dropout else speed
             quality = None if rand() < self.field_dropout else quality
             mistake = None if rand() < self.field_dropout else mistake
+            advantage = None if rand() < self.advantage_dropout else advantage
         if rand() < self.subtask_dropout:
             subtask = None
 
         prompt = format_metadata_prompt(
-            str(_to_python(data["prompt"])), subtask=subtask, speed=speed, quality=quality, mistake=mistake
+            str(_to_python(data["prompt"])),
+            subtask=subtask,
+            speed=speed,
+            quality=quality,
+            mistake=mistake,
+            advantage=advantage,
         )
         return {**data, "prompt": prompt}
 
@@ -456,8 +477,8 @@ class EpisodeMetadataPrompt(DataTransformFn):
 class InjectMetadataPrompt(DataTransformFn):
     """Adds the desired episode metadata to the prompt at inference time.
 
-    The defaults can be overridden per request by passing "subtask", "speed", "quality" or "mistake" in the
-    observation.
+    The defaults can be overridden per request by passing "subtask", "speed", "quality", "mistake" or "advantage" in
+    the observation.
     """
 
     # Desired episode length in steps. A good choice is a low percentile (e.g. 15th) of the episode lengths of the
@@ -465,6 +486,8 @@ class InjectMetadataPrompt(DataTransformFn):
     speed: int | None = None
     quality: int | None = 5
     mistake: bool | None = False
+    # RECAP advantage indicator. Only set this if the model was trained with advantages.
+    advantage: bool | None = None
     speed_bin_size: int = 500
 
     def __call__(self, data: DataDict) -> DataDict:
@@ -472,6 +495,7 @@ class InjectMetadataPrompt(DataTransformFn):
         speed = _to_python(data.pop("speed", self.speed))
         quality = _to_python(data.pop("quality", self.quality))
         mistake = _to_python(data.pop("mistake", self.mistake))
+        advantage = _to_python(data.pop("advantage", self.advantage))
         if "prompt" not in data:
             return data
 
@@ -479,8 +503,15 @@ class InjectMetadataPrompt(DataTransformFn):
             speed = bin_episode_speed(int(speed), self.speed_bin_size)
         if isinstance(mistake, str):
             mistake = mistake.lower() == "true"
+        if isinstance(advantage, str):
+            advantage = advantage.lower() in ("true", "positive")
         prompt = format_metadata_prompt(
-            str(_to_python(data["prompt"])), subtask=subtask, speed=speed, quality=quality, mistake=mistake
+            str(_to_python(data["prompt"])),
+            subtask=subtask,
+            speed=speed,
+            quality=quality,
+            mistake=mistake,
+            advantage=advantage,
         )
         return {**data, "prompt": prompt}
 
@@ -493,6 +524,59 @@ class UnconditionalPrompt(DataTransformFn):
         if "prompt" not in data:
             return data
         return {**data, "prompt_uncond": strip_metadata_prompt(str(_to_python(data["prompt"])))}
+
+
+def normalized_return(
+    frame: int, length: int, max_length: int, *, success: bool, failure_penalty: float, clip: bool = True
+) -> float:
+    """RECAP return: -1 per remaining step until the end of the episode, plus a penalty if the episode failed.
+
+    The return is normalized by the maximum episode length of the task so that it lies in [-1, 0].
+    """
+    value = -(length - 1 - frame) / max_length
+    if not success:
+        value -= failure_penalty
+    return max(-1.0, min(0.0, value)) if clip else value
+
+
+@dataclasses.dataclass(frozen=True)
+class ValueTarget(DataTransformFn):
+    """Adds the normalized return ("value_target") used to train the value function.
+
+    This must be applied to the raw dataset samples since it relies on "episode_index" and "frame_index".
+    """
+
+    # Maps episode index to {"length": int, "max_length": int, "success": bool}, where "max_length" is the maximum
+    # episode length of the episode's task.
+    episodes: Mapping[int, Mapping]
+    # Penalty added to the return of failed episodes, in units of the normalized return.
+    failure_penalty: float = 1.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "episode_index" not in data or "frame_index" not in data:
+            raise ValueError('Cannot compute the value target without "episode_index" and "frame_index".')
+        episode = self.episodes[int(data["episode_index"])]
+        value = normalized_return(
+            int(data["frame_index"]),
+            episode["length"],
+            episode["max_length"],
+            success=episode["success"],
+            failure_penalty=self.failure_penalty,
+        )
+        return {**data, "value_target": np.asarray(value, dtype=np.float32)}
+
+
+@dataclasses.dataclass(frozen=True)
+class PassthroughKeys(DataTransformFn):
+    """Applies `transform` and copies `keys` from the input to the output, e.g. to keep training targets that would
+    otherwise be removed by the repack or data transforms."""
+
+    transform: DataTransformFn
+    keys: Sequence[str]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        kept = {key: data[key] for key in self.keys if key in data}
+        return {**self.transform(data), **kept}
 
 
 @dataclasses.dataclass(frozen=True)
