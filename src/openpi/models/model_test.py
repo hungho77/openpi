@@ -126,3 +126,27 @@ def test_pi0_sample_actions_cfg():
     )
     cfg_actions = sample_actions(key, other_obs, num_steps=2, noise=noise, cfg_scale=0.0)
     assert jnp.allclose(uncond_actions, cfg_actions, atol=1e-2)
+
+
+def test_pi0_subgoal_images():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy")
+    model = config.create(key)
+
+    batch_size = 2
+    obs, act = config.fake_obs(batch_size), config.fake_act(batch_size)
+    subgoal_obs = dataclasses.replace(
+        obs,
+        subgoal_images=obs.images,
+        subgoal_image_masks={k: jnp.array([True, False]) for k in obs.images},
+    )
+    loss = model.compute_loss(key, subgoal_obs, act, train=True)
+    assert loss.shape == (batch_size, config.action_horizon)
+
+    sample_actions = nnx_utils.module_jit(model.sample_actions)
+    noise = jax.random.normal(key, (batch_size, config.action_horizon, config.action_dim))
+    actions = sample_actions(key, obs, num_steps=2, noise=noise)
+    subgoal_actions = sample_actions(key, subgoal_obs, num_steps=2, noise=noise)
+    assert subgoal_actions.shape == actions.shape
+    # A fully masked subgoal is equivalent to no subgoal.
+    assert jnp.allclose(actions[1], subgoal_actions[1], atol=1e-2)

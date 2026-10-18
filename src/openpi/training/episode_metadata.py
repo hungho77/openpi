@@ -106,6 +106,29 @@ class ValueTargetConfig:
     failure_penalty: float = 1.0
 
 
+@dataclasses.dataclass(frozen=True)
+class SubgoalConfig:
+    """Configures subgoal image conditioning.
+
+    During training, a future frame of the same episode is added as the subgoal to a fraction of the examples. At
+    inference time, the subgoal is passed in the "subgoal" key of the observation, using the same format as the
+    observation (e.g. {"observation/image": ..., "observation/wrist_image": ...}).
+    """
+
+    # Training: fraction of the examples that get a subgoal.
+    probability: float = 0.25
+    # Training: probability of using the last frame of the current annotated segment as the subgoal. Otherwise (or if
+    # the frame is not inside a segment), a frame between 0 and `max_horizon_s` seconds in the future is used.
+    end_of_segment_probability: float = 0.25
+    max_horizon_s: float = 4.0
+    # Training: probability of dropping the subtask from the prompt when a subgoal is given.
+    subtask_dropout: float = 0.3
+    # Annotations file with the segments. If None, the annotations of the episode metadata config are used.
+    annotations_path: str | None = None
+    # Model image keys used as subgoals, e.g. ("base_0_rgb",). If None, all views are used.
+    views: tuple[str, ...] | None = None
+
+
 def load_annotations(path: str | pathlib.Path) -> dict[int, dict]:
     """Loads the annotations file and converts it to the format expected by `EpisodeMetadataPrompt`."""
     with epath.Path(path).open() as f:

@@ -75,6 +75,10 @@ def _stack_cfg_observation(obs: _model.Observation) -> _model.Observation:
         state=stack(obs.state),
         tokenized_prompt=jnp.concatenate([obs.tokenized_prompt, obs.tokenized_prompt_uncond], axis=0),
         tokenized_prompt_mask=jnp.concatenate([obs.tokenized_prompt_mask, obs.tokenized_prompt_uncond_mask], axis=0),
+        subgoal_images=None if obs.subgoal_images is None else {k: stack(v) for k, v in obs.subgoal_images.items()},
+        subgoal_image_masks=None
+        if obs.subgoal_image_masks is None
+        else {k: stack(v) for k, v in obs.subgoal_image_masks.items()},
     )
 
 
@@ -146,6 +150,15 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # add subgoal images as a separate block: they attend to the images, language and each other, but the
+        # images and language do not attend to them
+        if obs.subgoal_images is not None:
+            for i, name in enumerate(obs.subgoal_images):
+                subgoal_tokens, _ = self.PaliGemma.img(obs.subgoal_images[name], train=False)
+                tokens.append(subgoal_tokens)
+                input_mask.append(einops.repeat(obs.subgoal_image_masks[name], "b -> b s", s=subgoal_tokens.shape[1]))
+                ar_mask += [i == 0] + [False] * (subgoal_tokens.shape[1] - 1)
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)

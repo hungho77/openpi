@@ -107,6 +107,10 @@ class Observation(Generic[ArrayT]):
     # Normalized return in [-1, 0], only used to train the value function.
     value_target: at.Float[ArrayT, "*b"] | None = None
 
+    # Optional subgoal images (desired near-future observation), in [-1, 0] float32, and their masks.
+    subgoal_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
+    subgoal_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -123,11 +127,13 @@ class Observation(Generic[ArrayT]):
         if ("tokenized_prompt_uncond" in data) != ("tokenized_prompt_uncond_mask" in data):
             raise ValueError("tokenized_prompt_uncond and tokenized_prompt_uncond_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        for image_key in ("image", "subgoal_image"):
+            for key in data.get(image_key) or {}:
+                image = data[image_key][key]
+                if image.dtype == np.uint8:
+                    data[image_key][key] = image.astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(image, "dtype") and image.dtype == torch.uint8:
+                    data[image_key][key] = image.to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -137,6 +143,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_uncond=data.get("tokenized_prompt_uncond"),
             tokenized_prompt_uncond_mask=data.get("tokenized_prompt_uncond_mask"),
             value_target=data.get("value_target"),
+            subgoal_images=data.get("subgoal_image"),
+            subgoal_image_masks=data.get("subgoal_image_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -146,6 +154,8 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        result["subgoal_image"] = result.pop("subgoal_images")
+        result["subgoal_image_mask"] = result.pop("subgoal_image_masks")
         return result
 
 
@@ -210,6 +220,16 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
+    # Subgoal images are only resized, they are not augmented.
+    subgoal_images = subgoal_masks = None
+    if observation.subgoal_images is not None:
+        subgoal_images, subgoal_masks = {}, {}
+        for key, image in observation.subgoal_images.items():
+            needs_resize = image.shape[1:3] != image_resolution
+            subgoal_images[key] = image_tools.resize_with_pad(image, *image_resolution) if needs_resize else image
+            masks = observation.subgoal_image_masks or {}
+            subgoal_masks[key] = jnp.asarray(masks[key]) if key in masks else jnp.ones(batch_shape, dtype=jnp.bool)
+
     return Observation(
         images=out_images,
         image_masks=out_masks,
@@ -219,6 +239,8 @@ def preprocess_observation(
         tokenized_prompt_uncond=observation.tokenized_prompt_uncond,
         tokenized_prompt_uncond_mask=observation.tokenized_prompt_uncond_mask,
         value_target=observation.value_target,
+        subgoal_images=subgoal_images,
+        subgoal_image_masks=subgoal_masks,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

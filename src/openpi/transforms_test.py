@@ -222,3 +222,35 @@ def test_value_target():
 def test_passthrough_keys():
     transform = _transforms.PassthroughKeys(_transforms.RepackTransform({"a": "a"}), keys=("value_target",))
     assert transform({"a": 1, "b": 2, "value_target": 3}) == {"a": 1, "value_target": 3}
+
+
+def test_strip_subtask_prompt():
+    prompt = "clean up. Subtask: open the fridge. Quality: 5"
+    assert _transforms.strip_subtask_prompt(prompt) == "clean up. Quality: 5"
+    assert _transforms.strip_subtask_prompt(np.asarray("clean up")) == "clean up"
+
+
+def _to_model_images(data):
+    return {
+        "image": {"base_0_rgb": data["cam"], "left_wrist_0_rgb": data["wrist"]},
+        "image_mask": {"base_0_rgb": np.True_, "left_wrist_0_rgb": np.True_},
+        "state": data["state"],
+    }
+
+
+def test_subgoal_inputs():
+    obs = {"cam": np.zeros((2, 2, 3), np.uint8), "wrist": np.zeros((2, 2, 3), np.uint8), "state": np.zeros(3)}
+    goal = {"cam": np.ones((2, 2, 3), np.uint8), "wrist": np.ones((2, 2, 3), np.uint8)}
+    transform = _transforms.SubgoalInputs(_to_model_images, _to_model_images, views=("base_0_rgb",))
+
+    data = transform({**obs, "subgoal": goal})
+    assert np.all(data["subgoal_image"]["base_0_rgb"] == 1)
+    assert data["subgoal_image_mask"] == {"base_0_rgb": True, "left_wrist_0_rgb": False}
+    assert np.all(data["image"]["base_0_rgb"] == 0)
+
+    # Without a subgoal, nothing is added at inference time and empty subgoals are added for training.
+    assert "subgoal_image" not in transform(dict(obs))
+    transform = _transforms.SubgoalInputs(_to_model_images, _to_model_images, always_add=True)
+    data = transform(dict(obs))
+    assert not any(data["subgoal_image_mask"].values())
+    assert data["subgoal_image"]["base_0_rgb"].shape == (2, 2, 3)

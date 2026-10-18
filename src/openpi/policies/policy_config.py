@@ -10,6 +10,7 @@ import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
+from openpi.training import data_loader as _data_loader
 import openpi.transforms as transforms
 
 
@@ -83,17 +84,31 @@ def create_trained_policy(
                 uncond_transforms = [transforms.UnconditionalPrompt()]
                 sample_kwargs = {"cfg_scale": episode_metadata.cfg_scale, **(sample_kwargs or {})}
 
+    input_transforms = [
+        *repack_transforms.inputs,
+        transforms.InjectDefaultPrompt(default_prompt),
+        *metadata_transforms,
+        *data_config.data_transforms.inputs,
+        transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *uncond_transforms,
+        *data_config.model_transforms.inputs,
+    ]
+    if data_config.subgoal is not None:
+        if is_pytorch or train_config.model.model_type == _model.ModelType.PI0_FAST:
+            logging.warning("Subgoal images are only supported for JAX pi0 models, ignoring them.")
+        else:
+            # The subgoal is passed in the "subgoal" key of the observation, using the same format as the observation.
+            input_transforms = [
+                transforms.SubgoalInputs(
+                    transforms.compose(input_transforms),
+                    transforms.compose(_data_loader.subgoal_input_transforms(data_config, repack_transforms)),
+                    views=data_config.subgoal.views,
+                )
+            ]
+
     return _policy.Policy(
         model,
-        transforms=[
-            *repack_transforms.inputs,
-            transforms.InjectDefaultPrompt(default_prompt),
-            *metadata_transforms,
-            *data_config.data_transforms.inputs,
-            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *uncond_transforms,
-            *data_config.model_transforms.inputs,
-        ],
+        transforms=input_transforms,
         output_transforms=[
             *data_config.model_transforms.outputs,
             transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),

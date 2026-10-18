@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import random
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -58,6 +59,55 @@ class TransformedDataset(Dataset[T_co]):
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class SubgoalDataset(Dataset):
+    """Adds a future frame of the same episode as the subgoal ("subgoal" key) to a fraction of the examples."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        config: _episode_metadata.SubgoalConfig,
+        *,
+        episode_index: np.ndarray,
+        frame_index: np.ndarray,
+        episode_lengths: dict[int, int],
+        segments: dict[int, tuple],
+        fps: float,
+    ):
+        self._dataset = dataset
+        self._config = config
+        self._episode_index = episode_index
+        self._frame_index = frame_index
+        self._episode_lengths = episode_lengths
+        self._segments = segments
+        self._max_offset = round(config.max_horizon_s * fps)
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        item = self._dataset[index]
+        if random.random() >= self._config.probability:
+            return item
+
+        index = int(index)
+        episode, frame = int(self._episode_index[index]), int(self._frame_index[index])
+        last_frame = self._episode_lengths[episode] - 1
+        target = None
+        if random.random() < self._config.end_of_segment_probability:
+            for start, end, *_ in self._segments.get(episode, ()):
+                if start <= frame < end:
+                    target = min(end - 1, last_frame)
+                    break
+        if target is None:
+            target = min(frame + random.randint(0, self._max_offset), last_frame)
+        # Frames of an episode are stored contiguously.
+        subgoal = self._dataset[index + target - frame]
+
+        if "prompt" in item and random.random() < self._config.subtask_dropout:
+            item = {**item, "prompt": _transforms.strip_subtask_prompt(item["prompt"])}
+        return {**item, "subgoal": subgoal}
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -145,6 +195,7 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    lerobot_ds = dataset
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -156,6 +207,21 @@ def create_torch_dataset(
     if data_config.value_target is not None:
         dataset = TransformedDataset(
             dataset, [_episode_metadata.create_value_transform(data_config.value_target, dataset_meta)]
+        )
+    if data_config.subgoal is not None:
+        annotations_path = data_config.subgoal.annotations_path
+        if annotations_path is None and data_config.episode_metadata is not None:
+            annotations_path = data_config.episode_metadata.annotations_path
+        annotations = _episode_metadata.load_annotations(annotations_path) if annotations_path is not None else {}
+        columns = lerobot_ds.hf_dataset.select_columns(["episode_index", "frame_index"]).with_format("numpy")
+        dataset = SubgoalDataset(
+            dataset,
+            data_config.subgoal,
+            episode_index=np.asarray(columns["episode_index"]),
+            frame_index=np.asarray(columns["frame_index"]),
+            episode_lengths=_episode_metadata.get_episode_lengths(dataset_meta),
+            segments={index: episode.get("segments", ()) for index, episode in annotations.items()},
+            fps=dataset_meta.fps,
         )
 
     return dataset
@@ -196,10 +262,26 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         *data_config.model_transforms.inputs,
     ]
+    if data_config.subgoal is not None:
+        transforms = [
+            _transforms.SubgoalInputs(
+                _transforms.compose(transforms),
+                _transforms.compose(subgoal_input_transforms(data_config, data_config.repack_transforms)),
+                views=data_config.subgoal.views,
+                always_add=True,
+            )
+        ]
     if data_config.value_target is not None:
         # The value target is added to the raw samples and would otherwise be removed by the repack transforms.
         transforms = [_transforms.PassthroughKeys(_transforms.compose(transforms), keys=("value_target",))]
     return TransformedDataset(dataset, transforms)
+
+
+def subgoal_input_transforms(
+    data_config: _config.DataConfig, repack_transforms: _transforms.Group
+) -> list[_transforms.DataTransformFn]:
+    """Transforms that convert a subgoal (same format as the observation) into model images."""
+    return [*repack_transforms.inputs, *data_config.data_transforms.inputs, _transforms.ResizeImages(224, 224)]
 
 
 def transform_iterable_dataset(
@@ -254,8 +336,8 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
-        if data_config.episode_metadata is not None or data_config.value_target is not None:
-            raise ValueError("Episode metadata and value targets are only supported for LeRobot datasets.")
+        if any(x is not None for x in (data_config.episode_metadata, data_config.value_target, data_config.subgoal)):
+            raise ValueError("Episode metadata, value targets and subgoals are only supported for LeRobot datasets.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,

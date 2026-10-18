@@ -1,6 +1,7 @@
 import dataclasses
 
 import jax
+import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -82,3 +83,31 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_subgoal_dataset():
+    from openpi.training import episode_metadata as _episode_metadata
+
+    # Two episodes of length 5 and 10, stored contiguously. Each item is its global index.
+    episode_index = np.array([0] * 5 + [1] * 10)
+    frame_index = np.array(list(range(5)) + list(range(10)))
+    items = [{"index": i, "prompt": "task. Subtask: grasp"} for i in range(15)]
+    config = _episode_metadata.SubgoalConfig(
+        probability=1.0, end_of_segment_probability=0.5, max_horizon_s=1.0, subtask_dropout=0.0
+    )
+    dataset = _data_loader.SubgoalDataset(
+        items,
+        config,
+        episode_index=episode_index,
+        frame_index=frame_index,
+        episode_lengths={0: 5, 1: 10},
+        segments={1: ((0, 4, "grasp", None),)},
+        fps=3,
+    )
+    for _ in range(50):
+        for i in range(15):
+            item = dataset[i]
+            goal = item["subgoal"]["index"]
+            # The subgoal is in the same episode, in the future, and at most 3 frames (1 second) ahead.
+            assert episode_index[goal] == episode_index[i]
+            assert i <= goal <= i + 3 or (i in (5, 6, 7, 8) and goal == 8)

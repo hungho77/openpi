@@ -579,6 +579,52 @@ class PassthroughKeys(DataTransformFn):
         return {**self.transform(data), **kept}
 
 
+_SUBTASK_PATTERN = re.compile(r"\.\s*Subtask: [^.,]*")
+
+
+def strip_subtask_prompt(prompt) -> str:
+    """Removes the subtask from a prompt built by `format_metadata_prompt`."""
+    return _SUBTASK_PATTERN.sub("", str(_to_python(prompt)))
+
+
+@dataclasses.dataclass(frozen=True)
+class SubgoalInputs(DataTransformFn):
+    """Adds subgoal images ("subgoal_image" / "subgoal_image_mask") to the model inputs.
+
+    The subgoal is passed in the "subgoal" key, using the same format as the observation (e.g. the same image keys as
+    the dataset or the robot runtime). It is converted with `subgoal_transform`, which should contain the same input
+    transforms as the observation images (e.g. the robot specific data transforms and the image resizing), and only
+    its images are kept. All other inputs are processed with `transform`.
+    """
+
+    transform: DataTransformFn
+    subgoal_transform: DataTransformFn
+    # Restricts the subgoal to these model image keys, e.g. ("base_0_rgb",). The other views are masked out.
+    views: Sequence[str] | None = None
+    # If true, empty (fully masked) subgoal images are added when there is no subgoal, so that all examples have the
+    # same structure. Required for training.
+    always_add: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        subgoal = data.pop("subgoal", None)
+        if subgoal is not None:
+            # The rest of the observation is included since the data transforms may rely on it (e.g. the state).
+            subgoal_inputs = self.subgoal_transform({**data, **subgoal})
+        outputs = self.transform(data)
+
+        if subgoal is not None:
+            images = subgoal_inputs["image"]
+            masks = {key: np.asarray(subgoal_inputs["image_mask"][key]) for key in images}
+            if self.views is not None:
+                masks = {key: mask & (key in self.views) for key, mask in masks.items()}
+        elif self.always_add:
+            images = {key: np.zeros_like(image) for key, image in outputs["image"].items()}
+            masks = dict.fromkeys(images, np.False_)
+        else:
+            return outputs
+        return {**outputs, "subgoal_image": images, "subgoal_image_mask": masks}
+
+
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""

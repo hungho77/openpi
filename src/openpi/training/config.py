@@ -97,6 +97,9 @@ class DataConfig:
     # If set, the normalized return is added to each example to train the RECAP value function. Only supported for
     # LeRobot datasets.
     value_target: _episode_metadata.ValueTargetConfig | None = None
+    # If set, future frames are used as subgoal images for a fraction of the examples. Only supported for LeRobot
+    # datasets and the JAX pi0 / pi05 models.
+    subgoal: _episode_metadata.SubgoalConfig | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -787,6 +790,36 @@ _CONFIGS = [
                     target_speed=100,
                     cfg_scale=1.0,
                 ),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Example of subgoal image conditioning together with episode metadata prompting. A future frame of the same
+    # episode is added as the subgoal to 25% of the examples. At inference time, pass the subgoal in the "subgoal" key
+    # of the observation, e.g. {"observation/image": ..., "observation/wrist_image": ...}.
+    TrainConfig(
+        name="pi05_libero_subgoal",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=25,
+                    target_speed=100,
+                ),
+                subgoal=_episode_metadata.SubgoalConfig(views=("base_0_rgb", "left_wrist_0_rgb")),
             ),
             extra_delta_transform=False,
         ),
