@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import logging
 import os
 
@@ -10,6 +11,9 @@ from transformers import AutoProcessor
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
+# Size of the PaliGemma vocabulary, the FAST tokens are mapped to its last tokens.
+PALIGEMMA_VOCAB_SIZE = 257_152
+
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
@@ -19,18 +23,38 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def encode_prompt(self, prompt: str, state: np.ndarray | None = None) -> list[int]:
+        """Returns the (unpadded) prompt tokens."""
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
             full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-            tokens = self._tokenizer.encode(full_prompt, add_bos=True)
-        else:
-            # This is the Pi0 format, where the state is part of the continuous action expert input.
-            # tokenize "\n" separately as the "start of answer" token
-            tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+            return self._tokenizer.encode(full_prompt, add_bos=True)
+        # This is the Pi0 format, where the state is part of the continuous action expert input.
+        # tokenize "\n" separately as the "start of answer" token
+        return self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+
+    def tokenize_with_action_tokens(
+        self, prompt: str, state: np.ndarray | None, action_tokens: Sequence[int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Appends discrete action tokens (e.g. FAST) after the prompt, used for knowledge insulation.
+
+        Returns the tokens, the token mask, the autoregressive mask (causal attention for the action tokens) and the
+        loss mask (on the action tokens only).
+        """
+        prefix = self.encode_prompt(prompt, state)
+        postfix = list(action_tokens) + self._tokenizer.encode("|", add_eos=True)
+        return _pad_token_sequences(
+            self._max_len,
+            prefix + postfix,
+            [0] * len(prefix) + [1] * len(postfix),
+            [False] * len(prefix) + [True] * len(postfix),
+        )
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        tokens = self.encode_prompt(prompt, state)
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -46,6 +70,84 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+
+
+def _pad_token_sequences(
+    max_len: int, tokens: list[int], ar_mask: list[int], loss_mask: list[bool]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pads (or truncates) the tokens and masks to `max_len`. Returns tokens, token mask, ar mask and loss mask."""
+    if len(tokens) > max_len:
+        logging.warning(
+            f"Token length ({len(tokens)}) exceeds max length ({max_len}), truncating. "
+            "Consider increasing the `max_token_len` in your model config if this happens frequently."
+        )
+    tokens, ar_mask, loss_mask = tokens[:max_len], ar_mask[:max_len], loss_mask[:max_len]
+    padding = max_len - len(tokens)
+    token_mask = [True] * len(tokens) + [False] * padding
+    return (
+        np.asarray(tokens + [0] * padding),
+        np.asarray(token_mask),
+        np.asarray(ar_mask + [0] * padding),
+        np.asarray(loss_mask + [False] * padding),
+    )
+
+
+class FASTActionTokenizer:
+    """Encodes action chunks with the FAST tokenizer into the last tokens of the PaliGemma vocabulary.
+
+    The FAST tokenizer is loaded lazily, so that it is only downloaded when it is used (i.e. during training).
+    """
+
+    def __init__(self, fast_tokenizer_path: str | None = "physical-intelligence/fast", fast_tokenizer=None):
+        self._fast_tokenizer_path = fast_tokenizer_path
+        self._fast_tokenizer = fast_tokenizer
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+    def __getstate__(self):
+        # Do not pickle the tokenizer, it is loaded again in each worker.
+        state = self.__dict__.copy()
+        if self._fast_tokenizer_path is not None:
+            state["_fast_tokenizer"] = None
+        return state
+
+    def encode(self, actions: np.ndarray) -> list[int]:
+        if self._fast_tokenizer is None:
+            self._fast_tokenizer = AutoProcessor.from_pretrained(self._fast_tokenizer_path, trust_remote_code=True)
+        action_tokens = np.asarray(self._fast_tokenizer(actions[None])[0])
+        return (PALIGEMMA_VOCAB_SIZE - 1 - self._fast_skip_tokens - action_tokens).tolist()
+
+
+class SubtaskTokenizer:
+    """Tokenizer of the high-level policy, which predicts the next subtask.
+
+    Format: "Task: <task>. Previous subtasks: <a>; <b>.\nSubtask: " followed by "<subtask>|" during training.
+    """
+
+    def __init__(self, max_len: int = 128):
+        self._max_len = max_len
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+    def tokenize(
+        self, task: str, previous_subtasks: str = "", subtask: str | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        task = task.strip().replace("_", " ").replace("\n", " ").rstrip(".")
+        previous = previous_subtasks.strip().replace("\n", " ").rstrip(".") or "none"
+        prefix = self._tokenizer.encode(f"Task: {task}. Previous subtasks: {previous}.\nSubtask: ", add_bos=True)
+        postfix = [] if subtask is None else self._tokenizer.encode(f"{subtask.strip()}|", add_eos=True)
+        return _pad_token_sequences(
+            self._max_len,
+            prefix + postfix,
+            [0] * len(prefix) + [1] * len(postfix),
+            [False] * len(prefix) + [True] * len(postfix),
+        )
+
+    def decode(self, tokens: np.ndarray) -> str:
+        tokens = tokens.tolist()
+        if self._tokenizer.eos_id() in tokens:
+            tokens = tokens[: tokens.index(self._tokenizer.eos_id())]
+        return self._tokenizer.decode(tokens).split("|")[0].strip()
 
 
 class FASTTokenizer:

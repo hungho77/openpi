@@ -111,3 +111,33 @@ def test_subgoal_dataset():
             # The subgoal is in the same episode, in the future, and at most 3 frames (1 second) ahead.
             assert episode_index[goal] == episode_index[i]
             assert i <= goal <= i + 3 or (i in (5, 6, 7, 8) and goal == 8)
+
+
+def test_history_dataset():
+    items = [{"cam": np.arange(3), "cam_is_pad": np.array([True, False, False]), "state": i} for i in range(2)]
+    item = _data_loader.HistoryDataset(items, ["cam"], num_frames=2)[0]
+    assert item["cam"] == 2
+    assert [frame["cam"] for frame in item["history"]] == [0, 1]
+    assert item["history_valid"].tolist() == [False, True]
+    assert "cam_is_pad" not in item
+
+
+def test_subtask_target_dataset():
+    from openpi.training import episode_metadata as _episode_metadata
+
+    items = [{"index": i} for i in range(8)]
+    dataset = _data_loader.SubtaskTargetDataset(
+        items,
+        _episode_metadata.SubtaskTargetConfig(max_previous_subtasks=1),
+        episode_index=np.array([0] * 4 + [1] * 4),
+        frame_index=np.array([0, 1, 2, 3, 0, 1, 2, 3]),
+        episode_lengths={0: 4, 1: 4},
+        segments={1: ((0, 2, "a", None), (2, 4, "b", None)), 0: ((1, 2, None, True),)},
+    )
+    assert len(dataset) == 4
+    assert [(x["index"], x["subtask_target"], x["previous_subtasks"]) for x in dataset] == [
+        (4, "a", ""),
+        (5, "a", ""),
+        (6, "b", "a"),
+        (7, "b", "a"),
+    ]

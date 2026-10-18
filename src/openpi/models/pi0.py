@@ -79,6 +79,10 @@ def _stack_cfg_observation(obs: _model.Observation) -> _model.Observation:
         subgoal_image_masks=None
         if obs.subgoal_image_masks is None
         else {k: stack(v) for k, v in obs.subgoal_image_masks.items()},
+        history_images=None if obs.history_images is None else {k: stack(v) for k, v in obs.history_images.items()},
+        history_image_masks=None
+        if obs.history_image_masks is None
+        else {k: stack(v) for k, v in obs.history_image_masks.items()},
     )
 
 
@@ -86,6 +90,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.rtc_max_delay = config.rtc_max_delay
+        self.knowledge_insulation = config.knowledge_insulation
+        self.ki_max_fast_tokens = config.ki_max_fast_tokens
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -94,6 +101,7 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                knowledge_insulation=config.knowledge_insulation,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
@@ -118,19 +126,35 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        self.history_frames = config.history_frames
+        if config.history_frames > 0:
+            self.history_time_embedding = nnx.Param(jnp.zeros((config.history_frames, paligemma_config.width)))
+            self.history_proj = nnx.Linear(paligemma_config.width, paligemma_config.width, rngs=rngs)
+            self.history_gate = nnx.Param(jnp.zeros(()))
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, "*b s"]]:
+        # Called as a plain function so that it can be reused by other models with the same backbone.
+        tokens, input_mask, ar_mask, _ = Pi0._embed_prefix(self, obs)
+        return tokens, input_mask, ar_mask
+
+    def _embed_prefix(self, obs: _model.Observation):
+        """Embeds the prefix. Also returns the (start, length) of the language tokens in the prefix."""
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            if obs.history_images is not None and name in obs.history_images:
+                image_tokens = image_tokens + Pi0._embed_history(
+                    self, obs.history_images[name], obs.history_image_masks[name]
+                ).astype(image_tokens.dtype)
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -144,12 +168,14 @@ class Pi0(_model.BaseModel):
             ar_mask += [False] * image_tokens.shape[1]
 
         # add language (aka tokenized inputs)
+        text_range = (len(ar_mask), 0)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+            text_range = (text_range[0], tokenized_inputs.shape[1])
 
         # add subgoal images as a separate block: they attend to the images, language and each other, but the
         # images and language do not attend to them
@@ -162,17 +188,46 @@ class Pi0(_model.BaseModel):
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+
+        # language tokens with their own autoregressive mask (e.g. the FAST tokens used for knowledge insulation)
+        if obs.token_ar_mask is not None and obs.tokenized_prompt is not None:
+            start, length = text_range
+            ar_mask = jnp.broadcast_to(ar_mask, input_mask.shape)
+            ar_mask = ar_mask.at[:, start : start + length].set(obs.token_ar_mask.astype(jnp.bool_))
+        return tokens, input_mask, ar_mask, text_range
+
+    def _embed_history(
+        self, frames: at.Float[at.Array, "b n h w c"], masks: at.Bool[at.Array, "b n"]
+    ) -> at.Float[at.Array, "b s emb"]:
+        """Compresses the past frames of a camera into the same number of tokens as a single frame."""
+        if getattr(self, "history_frames", 0) == 0:
+            raise ValueError("The model was not configured with history frames (history_frames=0).")
+        batch_size, num_frames = frames.shape[:2]
+        if num_frames != self.history_frames:
+            raise ValueError(f"Expected {self.history_frames} history frames, got {num_frames}.")
+        frame_tokens, _ = self.PaliGemma.img(frames.reshape(-1, *frames.shape[2:]), train=False)
+        frame_tokens = frame_tokens.reshape(batch_size, num_frames, *frame_tokens.shape[1:]).astype(jnp.float32)
+        frame_tokens = frame_tokens + self.history_time_embedding.value[None, :, None, :]
+        weights = masks[..., None, None].astype(jnp.float32)
+        pooled = jnp.sum(frame_tokens * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1.0)
+        has_history = jnp.any(masks, axis=1)[:, None, None]
+        # the gate is initialized to zero, so that the model initially behaves like a model without history
+        return jnp.tanh(self.history_gate.value) * self.history_proj(pooled) * has_history
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b ah emb"] | None,
     ]:
+        """Embeds the noisy actions. The flow matching timestep is either shared by all actions ([b]) or given per
+        action ([b, ah]), which is used for real-time chunking."""
         input_mask = []
         ar_mask = []
         tokens = []
@@ -186,7 +241,9 @@ class Pi0(_model.BaseModel):
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        time_emb = posemb_sincos(
+            timestep.reshape(-1), self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+        ).reshape(*timestep.shape, -1)
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -197,7 +254,9 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            if time_emb.ndim == 2:
+                time_emb = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            time_tokens = time_emb
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -227,19 +286,67 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        # real-time chunking: the first `delay` actions are given (clean, with time 0) and excluded from the loss
+        action_time = time
+        loss_weights = None
+        if self.rtc_max_delay > 0:
+            delay = jax.random.randint(jax.random.fold_in(rng, 1), batch_shape, 0, self.rtc_max_delay + 1)
+            committed = jnp.arange(self.action_horizon) < delay[..., None]
+            x_t = jnp.where(committed[..., None], actions, x_t)
+            action_time = jnp.where(committed, 0.0, time[..., None])
+            # normalize so that the mean over the chunk is the mean over the predicted actions
+            loss_weights = ~committed * (self.action_horizon / jnp.maximum(self.action_horizon - delay, 1))[..., None]
+
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        prefix_tokens, prefix_mask, prefix_ar_mask, (text_start, text_len) = self._embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, action_time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        if prefix_ar_mask.ndim == 2:
+            suffix_ar_mask = jnp.broadcast_to(suffix_ar_mask, suffix_mask.shape)
+            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=1)
+        else:
+            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        # knowledge insulation: the prompt contains the FAST tokens of the action chunk, which are only predicted by the
+        # backbone. They are not available at inference time, so no other token attends to them and the positions of
+        # the following tokens are the same as without them.
+        use_ki = self.knowledge_insulation and observation.token_loss_mask is not None
+        if use_ki:
+            fast = jnp.zeros(input_mask.shape, jnp.bool_)
+            fast = fast.at[:, text_start : text_start + text_len].set(observation.token_ar_mask.astype(jnp.bool_))
+            fast = fast & input_mask
+            attn_mask = attn_mask & ~(~fast[:, :, None] & fast[:, None, :])
+            positions = jnp.where(fast, positions, jnp.cumsum(input_mask & ~fast, axis=1) - 1)
+
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if loss_weights is not None:
+            loss = loss * loss_weights
+        if use_ki:
+            loss = loss + self._fast_token_loss(prefix_out[:, text_start : text_start + text_len], observation)[:, None]
+        return loss
+
+    def _fast_token_loss(
+        self, text_out: at.Float[at.Array, "b l emb"], observation: _model.Observation
+    ) -> at.Float[at.Array, " b"]:
+        """Next token prediction loss on the FAST tokens."""
+        loss_mask = observation.token_loss_mask[:, 1:]
+        targets = observation.tokenized_prompt[:, 1:]
+        # only decode the positions with a loss, since the logits over the vocabulary are large
+        order = jnp.argsort(~loss_mask, axis=-1, stable=True)[:, : self.ki_max_fast_tokens]
+        selected_mask = jnp.take_along_axis(loss_mask, order, axis=-1)
+        selected_targets = jnp.take_along_axis(targets, order, axis=-1)
+        selected_out = jnp.take_along_axis(text_out[:, :-1], order[..., None], axis=1)
+        logits = self.PaliGemma.llm(selected_out, method="decode")
+        log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+        token_log_probs = jnp.take_along_axis(log_probs, selected_targets[..., None], axis=-1)[..., 0]
+        return -jnp.sum(token_log_probs * selected_mask, axis=-1) / jnp.maximum(jnp.sum(selected_mask, axis=-1), 1)
 
     @override
     def sample_actions(
@@ -250,7 +357,15 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         cfg_scale: float | at.Float[at.Array, ""] = 1.0,
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix_len: at.Int[at.Array, " b"] | None = None,
     ) -> _model.Actions:
+        """Samples an action chunk.
+
+        `action_prefix` (with `action_prefix_len` valid steps) contains already committed actions, e.g. the actions of
+        the previous chunk that are executed while this chunk is computed. They are kept fixed and the rest of the
+        chunk is generated to continue them. This requires a model trained with `rtc_max_delay` > 0.
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -273,12 +388,22 @@ class Pi0(_model.BaseModel):
 
         model_batch_size = observation.state.shape[0]
 
+        committed = None
+        if action_prefix is not None:
+            prefix_len = (
+                action_prefix_len if action_prefix_len is not None else jnp.full(batch_size, self.action_horizon)
+            )
+            committed = jnp.arange(self.action_horizon) < prefix_len[:, None]
+            noise = jnp.where(committed[..., None], action_prefix, noise)
+
         def step(carry):
             x_t, time = carry
+            action_time = jnp.broadcast_to(time, batch_size)
+            if committed is not None:
+                action_time = jnp.where(committed, 0.0, action_time[:, None])
             x_in = jnp.concatenate([x_t, x_t], axis=0) if use_cfg else x_t
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_in, jnp.broadcast_to(time, model_batch_size)
-            )
+            time_in = jnp.concatenate([action_time, action_time], axis=0) if use_cfg else action_time
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_in, time_in)
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -308,6 +433,9 @@ class Pi0(_model.BaseModel):
             if use_cfg:
                 v_cond, v_uncond = jnp.split(v_t, 2, axis=0)
                 v_t = v_uncond + cfg_scale * (v_cond - v_uncond)
+            if committed is not None:
+                # the committed actions stay fixed
+                v_t = jnp.where(committed[..., None], 0.0, v_t)
 
             return x_t + dt * v_t, time + dt
 

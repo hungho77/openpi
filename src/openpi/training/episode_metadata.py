@@ -129,6 +129,20 @@ class SubgoalConfig:
     views: tuple[str, ...] | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class SubtaskTargetConfig:
+    """Configures the training targets of the high-level policy, which predicts the next subtask.
+
+    Only frames inside annotated segments with a subtask are used. The previous subtasks of the episode are given as
+    context.
+    """
+
+    # Annotations file with the subtask segments.
+    annotations_path: str = ""
+    # Maximum number of previous subtasks given as context.
+    max_previous_subtasks: int = 5
+
+
 def load_annotations(path: str | pathlib.Path) -> dict[int, dict]:
     """Loads the annotations file and converts it to the format expected by `EpisodeMetadataPrompt`."""
     with epath.Path(path).open() as f:

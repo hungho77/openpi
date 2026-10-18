@@ -91,8 +91,26 @@ def create_trained_policy(
         *data_config.data_transforms.inputs,
         transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         *uncond_transforms,
-        *data_config.model_transforms.inputs,
     ]
+    output_transforms = [
+        *data_config.model_transforms.outputs,
+        transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.data_transforms.outputs,
+        *repack_transforms.outputs,
+    ]
+    if train_config.model.model_type == _model.ModelType.SUBTASK:
+        # High-level policy: the previous subtasks are passed in the "previous_subtasks" key of the observation and the
+        # policy returns the next subtask in the "subtask" key.
+        input_transforms = [
+            transforms.PassthroughKeys(transforms.compose(input_transforms), keys=("previous_subtasks",))
+        ]
+        output_transforms = [*data_config.model_transforms.outputs]
+    # Knowledge insulation only changes the training inputs.
+    model_input_transforms = [
+        t.for_inference() if isinstance(t, transforms.TokenizeKIInputs) else t
+        for t in data_config.model_transforms.inputs
+    ]
+    input_transforms = [*input_transforms, *model_input_transforms]
     if data_config.subgoal is not None:
         if is_pytorch or train_config.model.model_type == _model.ModelType.PI0_FAST:
             logging.warning("Subgoal images are only supported for JAX pi0 models, ignoring them.")
@@ -105,16 +123,24 @@ def create_trained_policy(
                     views=data_config.subgoal.views,
                 )
             ]
+    if (history_frames := getattr(train_config.model, "history_frames", 0)) > 0:
+        if is_pytorch:
+            logging.warning("History frames are only supported for JAX pi0 models, ignoring them.")
+        else:
+            # The past frames are passed in the "history" key of the observation, as a list of dicts (oldest first)
+            # with the same format as the observation.
+            input_transforms = [
+                transforms.HistoryInputs(
+                    transforms.compose(input_transforms),
+                    transforms.compose(_data_loader.subgoal_input_transforms(data_config, repack_transforms)),
+                    num_frames=history_frames,
+                )
+            ]
 
     return _policy.Policy(
         model,
         transforms=input_transforms,
-        output_transforms=[
-            *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.data_transforms.outputs,
-            *repack_transforms.outputs,
-        ],
+        output_transforms=output_transforms,
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,

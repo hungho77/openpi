@@ -126,7 +126,10 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        # The condition is either shared by all tokens ([b, d]) or given per token ([b, t, d]).
+        if modulation.ndim == 2:
+            modulation = modulation[:, None, :]
+        scale, shift, gate = jnp.split(modulation, 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -159,6 +162,10 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    # Knowledge insulation: when both experts are run together, the queries of the second expert (the action expert)
+    # only see stop-gradient keys and values of the first expert, so that the action expert loss does not update the
+    # backbone.
+    knowledge_insulation: bool = False
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -214,20 +221,33 @@ class Attention(nn.Module):
             v = jnp.concatenate([cache_v, v], axis=1)
 
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
 
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
 
-        # big_neg = jnp.finfo(logits.dtype).min
-        big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+        def attend(q, k, v, attn_mask):
+            logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+            # big_neg = jnp.finfo(logits.dtype).min
+            big_neg = -2.3819763e38  # See gemma/modules.py
+            masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+            probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+            return jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
 
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
-
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+        if self.knowledge_insulation and kv_cache is None and len(xs) == 2 and all(x is not None for x in xs):
+            n = xs[0].shape[1]
+            k_insulated = jnp.concatenate([jax.lax.stop_gradient(k[:, :n]), k[:, n:]], axis=1)
+            v_insulated = jnp.concatenate([jax.lax.stop_gradient(v[:, :n]), v[:, n:]], axis=1)
+            encoded = jnp.concatenate(
+                [
+                    attend(q[:, :n], k, v, attn_mask[:, :, :n]),
+                    attend(q[:, n:], k_insulated, v_insulated, attn_mask[:, :, n:]),
+                ],
+                axis=1,
+            )
+        else:
+            encoded = attend(q, k, v, attn_mask)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
         out = []
@@ -288,13 +308,14 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    knowledge_insulation: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, knowledge_insulation=self.knowledge_insulation, name="attn")
 
         pre_attn = []
         gates = []
@@ -346,6 +367,8 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # See `Attention.knowledge_insulation`.
+    knowledge_insulation: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -378,12 +401,17 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            knowledge_insulation=self.knowledge_insulation,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
+
+    def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Returns the logits over the vocabulary for the outputs of the first expert."""
+        return self.embedder.decode(x)
 
     @at.typecheck
     def __call__(
@@ -392,7 +420,7 @@ class Module(nn.Module):
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | at.Float[at.Array, "b _t _d"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,

@@ -34,6 +34,7 @@ class ModelType(enum.Enum):
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
     VALUE = "value"
+    SUBTASK = "subtask"
 
 
 # The model always expects these images
@@ -111,6 +112,10 @@ class Observation(Generic[ArrayT]):
     subgoal_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
     subgoal_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
 
+    # Optional past frames for each camera (oldest first), in [-1, 1] float32, and their masks.
+    history_images: dict[str, at.Float[ArrayT, "*b n h w c"]] | None = None
+    history_image_masks: dict[str, at.Bool[ArrayT, "*b n"]] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -127,12 +132,12 @@ class Observation(Generic[ArrayT]):
         if ("tokenized_prompt_uncond" in data) != ("tokenized_prompt_uncond_mask" in data):
             raise ValueError("tokenized_prompt_uncond and tokenized_prompt_uncond_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
-        for image_key in ("image", "subgoal_image"):
+        for image_key in ("image", "subgoal_image", "history_image"):
             for key in data.get(image_key) or {}:
                 image = data[image_key][key]
                 if image.dtype == np.uint8:
                     data[image_key][key] = image.astype(np.float32) / 255.0 * 2.0 - 1.0
-                elif hasattr(image, "dtype") and image.dtype == torch.uint8:
+                elif hasattr(image, "dtype") and image.dtype == torch.uint8 and image_key != "history_image":
                     data[image_key][key] = image.to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
@@ -145,6 +150,8 @@ class Observation(Generic[ArrayT]):
             value_target=data.get("value_target"),
             subgoal_images=data.get("subgoal_image"),
             subgoal_image_masks=data.get("subgoal_image_mask"),
+            history_images=data.get("history_image"),
+            history_image_masks=data.get("history_image_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -156,6 +163,8 @@ class Observation(Generic[ArrayT]):
         result["image_mask"] = result.pop("image_masks")
         result["subgoal_image"] = result.pop("subgoal_images")
         result["subgoal_image_mask"] = result.pop("subgoal_image_masks")
+        result["history_image"] = result.pop("history_images")
+        result["history_image_mask"] = result.pop("history_image_masks")
         return result
 
 
@@ -230,6 +239,20 @@ def preprocess_observation(
             masks = observation.subgoal_image_masks or {}
             subgoal_masks[key] = jnp.asarray(masks[key]) if key in masks else jnp.ones(batch_shape, dtype=jnp.bool)
 
+    # Past frames are only resized, they are not augmented.
+    history_images = history_masks = None
+    if observation.history_images is not None:
+        history_images, history_masks = {}, {}
+        for key, frames in observation.history_images.items():
+            leading_shape = frames.shape[:2]
+            if frames.shape[2:4] != image_resolution:
+                flat = image_tools.resize_with_pad(frames.reshape(-1, *frames.shape[2:]), *image_resolution)
+                history_images[key] = flat.reshape(*leading_shape, *flat.shape[1:])
+            else:
+                history_images[key] = frames
+            masks = observation.history_image_masks or {}
+            history_masks[key] = jnp.asarray(masks[key]) if key in masks else jnp.ones(leading_shape, jnp.bool)
+
     return Observation(
         images=out_images,
         image_masks=out_masks,
@@ -241,6 +264,8 @@ def preprocess_observation(
         value_target=observation.value_target,
         subgoal_images=subgoal_images,
         subgoal_image_masks=subgoal_masks,
+        history_images=history_images,
+        history_image_masks=history_masks,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

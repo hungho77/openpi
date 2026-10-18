@@ -254,3 +254,65 @@ def test_subgoal_inputs():
     data = transform(dict(obs))
     assert not any(data["subgoal_image_mask"].values())
     assert data["subgoal_image"]["base_0_rgb"].shape == (2, 2, 3)
+
+
+class _FakeFAST:
+    def __call__(self, actions):
+        return [[0, 1, 2]]
+
+
+def test_tokenize_ki_inputs():
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len=64)
+    fast = _tokenizer.FASTActionTokenizer(fast_tokenizer_path=None, fast_tokenizer=_FakeFAST())
+    transform = _transforms.TokenizeKIInputs(tokenizer, fast, discrete_state_input=True)
+    state = np.zeros(4)
+
+    data = transform({"prompt": "fold", "state": state, "actions": np.zeros((10, 4))})
+    prompt_tokens, _ = tokenizer.tokenize("fold", state)
+    num_prompt = int(_tokenizer.PaligemmaTokenizer(64).tokenize("fold", state)[1].sum())
+    # The prompt is unchanged and followed by the FAST tokens, "|" and the end of sequence token.
+    assert np.array_equal(data["tokenized_prompt"][:num_prompt], prompt_tokens[:num_prompt])
+    fast_tokens = data["tokenized_prompt"][num_prompt : num_prompt + 3]
+    assert fast_tokens.tolist() == [_tokenizer.PALIGEMMA_VOCAB_SIZE - 129 - i for i in range(3)]
+    assert not data["token_ar_mask"][:num_prompt].any()
+    assert data["token_ar_mask"][num_prompt : num_prompt + 3].all()
+    assert np.array_equal(data["token_ar_mask"].astype(bool), data["token_loss_mask"])
+
+    # Without actions, this is the regular prompt.
+    data = transform({"prompt": "fold", "state": state})
+    assert np.array_equal(data["tokenized_prompt"], prompt_tokens)
+    assert "token_ar_mask" not in data
+
+
+def test_subtask_tokenizer():
+    tokenizer = _tokenizer.SubtaskTokenizer(max_len=48)
+    transform = _transforms.TokenizeSubtaskInputs(tokenizer)
+    data = transform({"prompt": "clean up", "previous_subtasks": "open the fridge", "subtask_target": "grab the milk"})
+    tokens = data["tokenized_prompt"]
+    target = tokens[data["token_loss_mask"]]
+    assert tokenizer.decode(target) == "grab the milk"
+
+    data = transform({"prompt": "clean up"})
+    assert not data["token_loss_mask"].any()
+
+    extract = _transforms.ExtractSubtask(tokenizer)
+    assert extract({"actions": target.astype(np.float32), "state": np.zeros(2)}) == {"subtask": "grab the milk"}
+
+
+def test_history_inputs():
+    obs = {"cam": np.zeros((2, 2, 3), np.uint8), "wrist": np.zeros((2, 2, 3), np.uint8), "state": np.zeros(3)}
+    history = [{"cam": np.full((2, 2, 3), i, np.uint8), "wrist": np.full((2, 2, 3), i, np.uint8)} for i in (1, 2)]
+    transform = _transforms.HistoryInputs(_to_model_images, _to_model_images, num_frames=3)
+
+    data = transform({**obs, "history": history, "history_valid": np.array([False, True])})
+    frames = data["history_image"]["base_0_rgb"]
+    assert frames.shape == (3, 2, 2, 3)
+    # Missing frames are padded at the beginning and invalid frames are masked.
+    assert frames[1].max() == 1
+    assert frames[2].max() == 2
+    assert data["history_image_mask"]["base_0_rgb"].tolist() == [False, False, True]
+
+    assert "history_image" not in transform(dict(obs))
+    transform = _transforms.HistoryInputs(_to_model_images, _to_model_images, num_frames=3, dropout=1.0)
+    data = transform({**obs, "history": history})
+    assert not data["history_image_mask"]["base_0_rgb"].any()

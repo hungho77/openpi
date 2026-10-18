@@ -626,6 +626,125 @@ class SubgoalInputs(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class HistoryInputs(DataTransformFn):
+    """Adds the past frames of each camera ("history_image" / "history_image_mask") to the model inputs.
+
+    The past frames are passed in the "history" key as a list (oldest first) of dicts with the same format as the
+    observation, and optionally a "history_valid" array that marks padded frames. They are converted with
+    `frame_transform`, which should contain the same input transforms as the observation images. All other inputs are
+    processed with `transform`.
+    """
+
+    transform: DataTransformFn
+    frame_transform: DataTransformFn
+    num_frames: int
+    # Probability of dropping the whole history (training only).
+    dropout: float = 0.0
+    # If true, empty (fully masked) frames are added when there is no history, so that all examples have the same
+    # structure. Required for training.
+    always_add: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        history = data.pop("history", None)
+        valid = data.pop("history_valid", None)
+        converted = []
+        if history is not None:
+            history = list(history)[-self.num_frames :]
+            valid = [True] * len(history) if valid is None else [bool(v) for v in np.asarray(valid)][-len(history) :]
+            # The rest of the observation is included since the data transforms may rely on it (e.g. the state).
+            converted = [(self.frame_transform({**data, **frame}), v) for frame, v in zip(history, valid, strict=True)]
+        outputs = self.transform(data)
+        if history is None and not self.always_add:
+            return outputs
+
+        images = {
+            key: np.zeros((self.num_frames, *np.shape(image)), dtype=np.asarray(image).dtype)
+            for key, image in outputs["image"].items()
+        }
+        masks = {key: np.zeros(self.num_frames, dtype=bool) for key in images}
+        if converted and not (self.dropout > 0 and random.random() < self.dropout):
+            # Missing frames are padded at the beginning.
+            offset = self.num_frames - len(converted)
+            for i, (frame, is_valid) in enumerate(converted):
+                for key, frames in images.items():
+                    if key in frame["image"]:
+                        frames[offset + i] = frame["image"][key]
+                        masks[key][offset + i] = is_valid and bool(frame["image_mask"][key])
+        return {**outputs, "history_image": images, "history_image_mask": masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeKIInputs(DataTransformFn):
+    """Tokenizes the prompt and appends the FAST tokens of the action chunk (knowledge insulation, training only).
+
+    Without actions, this is the same as `TokenizePrompt`. At inference time, use `TokenizePrompt` instead (see
+    `for_inference`), since the actions passed for real-time chunking must not be tokenized.
+    """
+
+    tokenizer: _tokenizer.PaligemmaTokenizer
+    fast_tokenizer: _tokenizer.FASTActionTokenizer
+    discrete_state_input: bool = False
+
+    def for_inference(self) -> TokenizePrompt:
+        return TokenizePrompt(self.tokenizer, self.discrete_state_input)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data:
+            return self.for_inference()(data)
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+        state = data["state"] if self.discrete_state_input else None
+        action_tokens = self.fast_tokenizer.encode(np.asarray(data["actions"]))
+        tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize_with_action_tokens(
+            str(_to_python(prompt)), state, action_tokens
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeSubtaskInputs(DataTransformFn):
+    """Tokenizes the inputs of the high-level policy: task, previous subtasks and (during training) the subtask."""
+
+    tokenizer: _tokenizer.SubtaskTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+        previous = _to_python(data.pop("previous_subtasks", ""))
+        if not isinstance(previous, str):
+            previous = "; ".join(str(_to_python(p)) for p in previous)
+        target = data.pop("subtask_target", None)
+        tokens, mask, ar_mask, loss_mask = self.tokenizer.tokenize(
+            str(_to_python(prompt)), previous, None if target is None else str(_to_python(target))
+        )
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractSubtask(DataTransformFn):
+    """Decodes the subtask predicted by the high-level policy."""
+
+    tokenizer: _tokenizer.SubtaskTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        tokens = data.pop("actions")
+        data.pop("state", None)
+        return {**data, "subtask": self.tokenizer.decode(np.asarray(tokens).astype(np.int32))}
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

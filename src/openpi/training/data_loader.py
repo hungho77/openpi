@@ -113,6 +113,74 @@ class SubgoalDataset(Dataset):
         return len(self._dataset)
 
 
+class HistoryDataset(Dataset):
+    """Splits the camera frames loaded with a history (see `delta_timestamps`) into the current frame and the past
+    frames ("history", oldest first, and "history_valid", which is false for frames before the episode start)."""
+
+    def __init__(self, dataset: Dataset, camera_keys: Sequence[str], num_frames: int):
+        self._dataset = dataset
+        self._camera_keys = camera_keys
+        self._num_frames = num_frames
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        item = dict(self._dataset[index])
+        history = [{} for _ in range(self._num_frames)]
+        valid = np.ones(self._num_frames, dtype=bool)
+        for key in self._camera_keys:
+            frames = item[key]
+            item[key] = frames[-1]
+            for i in range(self._num_frames):
+                history[i][key] = frames[i]
+            if (is_pad := item.pop(f"{key}_is_pad", None)) is not None:
+                valid &= ~np.asarray(is_pad[: self._num_frames], dtype=bool)
+        return {**item, "history": history, "history_valid": valid}
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class SubtaskTargetDataset(Dataset):
+    """Examples for the high-level policy: the frames inside annotated subtask segments, with the subtask as the target
+    ("subtask_target") and the subtasks of the previous segments of the episode as context ("previous_subtasks")."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        config: _episode_metadata.SubtaskTargetConfig,
+        *,
+        episode_index: np.ndarray,
+        frame_index: np.ndarray,
+        episode_lengths: dict[int, int],
+        segments: dict[int, tuple],
+    ):
+        self._dataset = dataset
+        (starts,) = np.nonzero(frame_index == 0)
+        episode_starts = {int(episode_index[i]): int(i) for i in starts}
+        self._items = []
+        for episode, episode_segments in segments.items():
+            if episode not in episode_starts:
+                continue
+            subtasks = []
+            for start, end, subtask, *_ in sorted(episode_segments):
+                if not subtask:
+                    continue
+                previous = "; ".join(subtasks[-config.max_previous_subtasks :]) if config.max_previous_subtasks else ""
+                for frame in range(max(start, 0), min(end, episode_lengths[episode])):
+                    self._items.append((episode_starts[episode] + frame, subtask, previous))
+                if not subtasks or subtasks[-1] != subtask:
+                    subtasks.append(subtask)
+        if not self._items:
+            raise ValueError("No frames with a subtask found in the annotations.")
+        logging.info(f"High-level policy: {len(self._items)} frames with a subtask.")
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        frame, subtask, previous = self._items[int(index)]
+        return {**self._dataset[frame], "subtask_target": subtask, "previous_subtasks": previous}
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -189,13 +257,19 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    history_frames = getattr(model_config, "history_frames", 0)
+    if history_frames > 0:
+        # Past frames every `history_stride_s` seconds, followed by the current frame.
+        stride = model_config.history_stride_s
+        for key in dataset_meta.camera_keys:
+            delta_timestamps[key] = [-(history_frames - i) * stride for i in range(history_frames)] + [0.0]
+    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
     lerobot_ds = dataset
+    if history_frames > 0:
+        dataset = HistoryDataset(dataset, dataset_meta.camera_keys, history_frames)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -223,6 +297,17 @@ def create_torch_dataset(
             segments={index: episode.get("segments", ()) for index, episode in annotations.items()},
             fps=dataset_meta.fps,
         )
+    if data_config.subtask_targets is not None:
+        annotations = _episode_metadata.load_annotations(data_config.subtask_targets.annotations_path)
+        columns = lerobot_ds.hf_dataset.select_columns(["episode_index", "frame_index"]).with_format("numpy")
+        dataset = SubtaskTargetDataset(
+            dataset,
+            data_config.subtask_targets,
+            episode_index=np.asarray(columns["episode_index"]),
+            frame_index=np.asarray(columns["frame_index"]),
+            episode_lengths=_episode_metadata.get_episode_lengths(dataset_meta),
+            segments={index: episode.get("segments", ()) for index, episode in annotations.items()},
+        )
 
     return dataset
 
@@ -245,7 +330,13 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    model_config: _model.BaseModelConfig | None = None,
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -260,14 +351,29 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         *data_config.repack_transforms.inputs,
         *data_config.data_transforms.inputs,
         _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-        *data_config.model_transforms.inputs,
     ]
+    if data_config.subtask_targets is not None:
+        # The subtask targets are added to the raw samples and would otherwise be removed by the repack transforms.
+        transforms = [
+            _transforms.PassthroughKeys(_transforms.compose(transforms), keys=("subtask_target", "previous_subtasks"))
+        ]
+    transforms = [*transforms, *data_config.model_transforms.inputs]
     if data_config.subgoal is not None:
         transforms = [
             _transforms.SubgoalInputs(
                 _transforms.compose(transforms),
                 _transforms.compose(subgoal_input_transforms(data_config, data_config.repack_transforms)),
                 views=data_config.subgoal.views,
+                always_add=True,
+            )
+        ]
+    if (history_frames := getattr(model_config, "history_frames", 0)) > 0:
+        transforms = [
+            _transforms.HistoryInputs(
+                _transforms.compose(transforms),
+                _transforms.compose(subgoal_input_transforms(data_config, data_config.repack_transforms)),
+                num_frames=history_frames,
+                dropout=model_config.history_dropout,
                 always_add=True,
             )
         ]
@@ -336,8 +442,17 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
-        if any(x is not None for x in (data_config.episode_metadata, data_config.value_target, data_config.subgoal)):
-            raise ValueError("Episode metadata, value targets and subgoals are only supported for LeRobot datasets.")
+        features = (
+            data_config.episode_metadata,
+            data_config.value_target,
+            data_config.subgoal,
+            data_config.subtask_targets,
+        )
+        if any(x is not None for x in features) or getattr(config.model, "history_frames", 0) > 0:
+            raise ValueError(
+                "Episode metadata, value targets, subgoals, subtask targets and history frames are only supported "
+                "for LeRobot datasets."
+            )
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -395,7 +510,7 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, model_config=model_config)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size

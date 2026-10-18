@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.subtask_policy as subtask_policy
 import openpi.models.tokenizer as _tokenizer
 import openpi.models.value_model as value_model
 import openpi.policies.aloha_policy as aloha_policy
@@ -100,6 +101,8 @@ class DataConfig:
     # If set, future frames are used as subgoal images for a fraction of the examples. Only supported for LeRobot
     # datasets and the JAX pi0 / pi05 models.
     subgoal: _episode_metadata.SubgoalConfig | None = None
+    # If set, the examples are the subtask segments of the annotations file, used to train the high-level policy.
+    subtask_targets: _episode_metadata.SubtaskTargetConfig | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -123,29 +126,35 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI05 | _model.ModelType.VALUE:
+                assert isinstance(model_config, pi0_config.Pi0Config | value_model.ValueConfig)
+                discrete_state_input = model_config.model_type != _model.ModelType.PI0 and bool(
+                    model_config.discrete_state_input
+                )
+                tokenizer = _tokenizer.PaligemmaTokenizer(model_config.max_token_len)
+                if getattr(model_config, "knowledge_insulation", False):
+                    tokenize = _transforms.TokenizeKIInputs(
+                        tokenizer, _tokenizer.FASTActionTokenizer(), discrete_state_input=discrete_state_input
+                    )
+                else:
+                    tokenize = _transforms.TokenizePrompt(tokenizer, discrete_state_input=discrete_state_input)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
+                        tokenize,
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
-            case _model.ModelType.PI05 | _model.ModelType.VALUE:
-                assert isinstance(model_config, pi0_config.Pi0Config | value_model.ValueConfig)
+            case _model.ModelType.SUBTASK:
+                tokenizer = _tokenizer.SubtaskTokenizer(model_config.max_token_len)
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.TokenizeSubtaskInputs(tokenizer),
                     ],
+                    outputs=[_transforms.ExtractSubtask(tokenizer)],
                 )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
@@ -834,6 +843,68 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    # All the pi0.7-style features together: episode metadata prompting, subgoal images, training-time real-time
+    # chunking, memory (past frames) and knowledge insulation.
+    TrainConfig(
+        name="pi05_libero_pi07",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            # Leaves room for the FAST tokens used by knowledge insulation.
+            max_token_len=300,
+            rtc_max_delay=3,
+            history_frames=2,
+            history_stride_s=1.0,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(speed_bin_size=25, target_speed=100),
+                subgoal=_episode_metadata.SubgoalConfig(views=("base_0_rgb", "left_wrist_0_rgb")),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params", missing_regex=".*lora.*|.*history_.*"
+        ),
+        num_train_steps=30_000,
+    ),
+    # High-level policy that predicts the next subtask from the images, the task and the previous subtasks. Trained on
+    # the subtask segments of the annotations file (e.g. collected by verbally coaching the low-level policy).
+    TrainConfig(
+        name="subtask_libero",
+        model=subtask_policy.SubtaskPolicyConfig(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                subtask_targets=_episode_metadata.SubtaskTargetConfig(annotations_path="/path/to/annotations.json"),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=20_000,
     ),
     # RECAP, step 1: value function. Trained on the returns of successful and failed episodes (see the "success"
     # labels in the annotations file) and initialized from the pi05 backbone. Afterwards, run

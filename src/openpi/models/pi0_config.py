@@ -32,6 +32,28 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Training-time real-time chunking: during training, the first d actions of each chunk (d uniformly sampled in
+    # [0, rtc_max_delay]) are given as already committed actions (clean actions with flow time 0) and excluded from
+    # the loss. At inference time, the actions that will be executed while the next chunk is being computed can then
+    # be passed as an action prefix, which gives smooth transitions between chunks. 0 disables it.
+    rtc_max_delay: int = 0
+
+    # Memory: number of past frames per camera, sampled every `history_stride_s` seconds. The past frames are encoded
+    # with the same vision encoder and compressed into the tokens of the current frame (the number of tokens does not
+    # depend on the number of frames). The history is dropped with probability `history_dropout` during training.
+    # 0 disables it.
+    history_frames: int = 0
+    history_stride_s: float = 1.0
+    history_dropout: float = 0.3
+
+    # Knowledge insulation: the backbone is additionally trained to predict the FAST tokens of the action chunk with a
+    # cross-entropy loss, and the action expert only sees stop-gradient backbone activations, so that the flow
+    # matching loss does not update the backbone. Only used during training. `max_token_len` must leave room for the
+    # FAST tokens.
+    knowledge_insulation: bool = False
+    # Maximum number of FAST tokens (including the end of sequence tokens) used for the cross-entropy loss.
+    ki_max_fast_tokens: int = 128
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
