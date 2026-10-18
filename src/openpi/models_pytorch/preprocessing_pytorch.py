@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import logging
+import types
 
 import torch
 
@@ -156,18 +157,58 @@ def preprocess_observation_pytorch(
         else:
             out_masks[key] = observation.image_masks[key]
 
-    # Create a simple object with the required attributes instead of using the complex Observation class
-    class SimpleProcessedObservation:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
+    # Subgoal images are only resized, they are not augmented.
+    subgoal_images = subgoal_masks = None
+    if getattr(observation, "subgoal_images", None) is not None:
+        subgoal_images, subgoal_masks = {}, {}
+        masks = observation.subgoal_image_masks or {}
+        for key, image in observation.subgoal_images.items():
+            subgoal_images[key] = _to_channels_first(image, image_resolution)
+            subgoal_masks[key] = (
+                masks[key] if key in masks else torch.ones(batch_shape, dtype=torch.bool, device=image.device)
+            )
 
-    return SimpleProcessedObservation(
+    # Past frames ([B, n, ...]) are only resized, they are not augmented.
+    history_images = history_masks = None
+    if getattr(observation, "history_images", None) is not None:
+        history_images, history_masks = {}, {}
+        masks = observation.history_image_masks or {}
+        for key, frames in observation.history_images.items():
+            batch_size, num_frames = frames.shape[:2]
+            flat = frames.reshape(batch_size * num_frames, *frames.shape[2:])
+            if flat.dtype == torch.uint8:
+                flat = flat.to(torch.float32) / 255.0 * 2.0 - 1.0
+            flat = _to_channels_first(flat, image_resolution)
+            history_images[key] = flat.reshape(batch_size, num_frames, *flat.shape[1:])
+            history_masks[key] = (
+                masks[key]
+                if key in masks
+                else torch.ones(batch_size, num_frames, dtype=torch.bool, device=frames.device)
+            )
+
+    # A simple object with the required attributes instead of the complex Observation class.
+    return types.SimpleNamespace(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        tokenized_prompt_uncond=getattr(observation, "tokenized_prompt_uncond", None),
+        tokenized_prompt_uncond_mask=getattr(observation, "tokenized_prompt_uncond_mask", None),
+        value_target=getattr(observation, "value_target", None),
+        subgoal_images=subgoal_images,
+        subgoal_image_masks=subgoal_masks,
+        history_images=history_images,
+        history_image_masks=history_masks,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )
+
+
+def _to_channels_first(image: torch.Tensor, image_resolution: tuple[int, int]) -> torch.Tensor:
+    """Converts [B, H, W, C] or [B, C, H, W] images to [B, C, H, W] with the given resolution."""
+    if image.shape[1] != 3:
+        image = image.permute(0, 3, 1, 2)
+    if tuple(image.shape[2:4]) != tuple(image_resolution):
+        image = image_tools.resize_with_pad_torch(image, *image_resolution)
+    return image

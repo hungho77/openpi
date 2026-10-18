@@ -17,7 +17,7 @@ import orbax.checkpoint as ocp
 import safetensors
 import torch
 
-from openpi.models_pytorch import pi0_pytorch
+from openpi.models_pytorch import factory as pytorch_factory
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
@@ -137,8 +137,10 @@ class Observation(Generic[ArrayT]):
                 image = data[image_key][key]
                 if image.dtype == np.uint8:
                     data[image_key][key] = image.astype(np.float32) / 255.0 * 2.0 - 1.0
-                elif hasattr(image, "dtype") and image.dtype == torch.uint8 and image_key != "history_image":
-                    data[image_key][key] = image.to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                elif hasattr(image, "dtype") and image.dtype == torch.uint8:
+                    # PyTorch models use channels-first images.
+                    channels_first = (0, 1, 4, 2, 3) if image_key == "history_image" else (0, 3, 1, 2)
+                    data[image_key][key] = image.to(torch.float32).permute(*channels_first) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -305,7 +307,7 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        model = pytorch_factory.create_model(train_config.model)
         safetensors.torch.load_model(model, weight_path)
         return model
 

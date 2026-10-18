@@ -78,8 +78,8 @@ def create_trained_policy(
     if (episode_metadata := data_config.episode_metadata) is not None:
         metadata_transforms = episode_metadata.inference_transforms()
         if episode_metadata.cfg_scale != 1.0:
-            if is_pytorch or train_config.model.model_type == _model.ModelType.PI0_FAST:
-                logging.warning("Classifier-free guidance is only supported for JAX pi0 models, ignoring cfg_scale.")
+            if train_config.model.model_type == _model.ModelType.PI0_FAST:
+                logging.warning("Classifier-free guidance is only supported for pi0 models, ignoring cfg_scale.")
             else:
                 uncond_transforms = [transforms.UnconditionalPrompt()]
                 sample_kwargs = {"cfg_scale": episode_metadata.cfg_scale, **(sample_kwargs or {})}
@@ -112,8 +112,8 @@ def create_trained_policy(
     ]
     input_transforms = [*input_transforms, *model_input_transforms]
     if data_config.subgoal is not None:
-        if is_pytorch or train_config.model.model_type == _model.ModelType.PI0_FAST:
-            logging.warning("Subgoal images are only supported for JAX pi0 models, ignoring them.")
+        if train_config.model.model_type == _model.ModelType.PI0_FAST:
+            logging.warning("Subgoal images are only supported for pi0 models, ignoring them.")
         else:
             # The subgoal is passed in the "subgoal" key of the observation, using the same format as the observation.
             input_transforms = [
@@ -124,18 +124,15 @@ def create_trained_policy(
                 )
             ]
     if (history_frames := getattr(train_config.model, "history_frames", 0)) > 0:
-        if is_pytorch:
-            logging.warning("History frames are only supported for JAX pi0 models, ignoring them.")
-        else:
-            # The past frames are passed in the "history" key of the observation, as a list of dicts (oldest first)
-            # with the same format as the observation.
-            input_transforms = [
-                transforms.HistoryInputs(
-                    transforms.compose(input_transforms),
-                    transforms.compose(_data_loader.subgoal_input_transforms(data_config, repack_transforms)),
-                    num_frames=history_frames,
-                )
-            ]
+        # The past frames are passed in the "history" key of the observation, as a list of dicts (oldest first) with
+        # the same format as the observation.
+        input_transforms = [
+            transforms.HistoryInputs(
+                transforms.compose(input_transforms),
+                transforms.compose(_data_loader.subgoal_input_transforms(data_config, repack_transforms)),
+                num_frames=history_frames,
+            )
+        ]
 
     return _policy.Policy(
         model,

@@ -40,8 +40,7 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
-import openpi.models.pi0_config
-import openpi.models_pytorch.pi0_pytorch
+import openpi.models_pytorch.factory as _pytorch_factory
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -103,7 +102,9 @@ def setup_ddp():
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    # Each process may only see its own GPU (e.g. one MIG instance per process via CUDA_VISIBLE_DEVICES).
+    device_index = local_rank if torch.cuda.is_available() and torch.cuda.device_count() > local_rank else 0
+    device = torch.device(f"cuda:{device_index}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
     return use_ddp, local_rank, device
@@ -389,24 +390,10 @@ def train_loop(config: _config.TrainConfig):
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
 
-    # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
-        model_cfg = openpi.models.pi0_config.Pi0Config(
-            dtype=config.pytorch_training_precision,
-            action_dim=config.model.action_dim,
-            action_horizon=config.model.action_horizon,
-            max_token_len=config.model.max_token_len,
-            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
-            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
-            pi05=getattr(config.model, "pi05", False),
-        )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    # Build model (pi0 / pi05, value function or high-level policy) with the training precision.
+    model_cfg = config.model
+    object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    model = _pytorch_factory.create_model(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -443,7 +430,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
+        # Weights that are not in the checkpoint (e.g. the history encoder or the value head) keep their initial values.
+        _pytorch_factory.load_pretrained_weights(
             (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")

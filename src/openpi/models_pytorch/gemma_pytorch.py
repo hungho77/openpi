@@ -8,6 +8,89 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
 
+def make_paligemma_config(vlm_config, *, use_adarms: bool = False):
+    """Returns the Hugging Face PaliGemma config for an openpi Gemma config."""
+    vlm_config_hf = CONFIG_MAPPING["paligemma"]()
+    vlm_config_hf._vocab_size = 257152  # noqa: SLF001
+    vlm_config_hf.image_token_index = 257152
+    vlm_config_hf.text_config.hidden_size = vlm_config.width
+    vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
+    vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
+    vlm_config_hf.text_config.head_dim = vlm_config.head_dim
+    vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
+    vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
+    vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
+    vlm_config_hf.text_config.torch_dtype = "float32"
+    vlm_config_hf.text_config.vocab_size = 257152
+    vlm_config_hf.text_config.use_adarms = use_adarms
+    vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms else None
+    vlm_config_hf.vision_config.intermediate_size = 4304
+    # The image tokens are projected to the width of the language model (2048 for gemma_2b).
+    vlm_config_hf.vision_config.projection_dim = vlm_config.width
+    vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
+    vlm_config_hf.vision_config.torch_dtype = "float32"
+    return vlm_config_hf
+
+
+_PARAMS_TO_KEEP_FLOAT32 = (
+    "vision_tower.vision_model.embeddings.patch_embedding.weight",
+    "vision_tower.vision_model.embeddings.patch_embedding.bias",
+    "vision_tower.vision_model.embeddings.position_embedding.weight",
+    "input_layernorm",
+    "post_attention_layernorm",
+    "model.norm",
+)
+
+
+def _set_precision(module: nn.Module, precision: Literal["bfloat16", "float32"]):
+    if precision == "bfloat16":
+        module.to(dtype=torch.bfloat16)
+    elif precision == "float32":
+        module.to(dtype=torch.float32)
+        return
+    else:
+        raise ValueError(f"Invalid precision: {precision}")
+
+    for name, param in module.named_parameters():
+        if any(selector in name for selector in _PARAMS_TO_KEEP_FLOAT32):
+            param.data = param.data.to(dtype=torch.float32)
+
+
+class PaliGemmaBackboneModel(nn.Module):
+    """The PaliGemma backbone (vision encoder and language model) without an action expert.
+
+    Uses the same parameter names as `PaliGemmaWithExpertModel`, so that it can be initialized from pi0 / pi05
+    checkpoints. Used by the value function and the high-level policy.
+    """
+
+    def __init__(self, vlm_config, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+        super().__init__()
+        self.paligemma = PaliGemmaForConditionalGeneration(config=make_paligemma_config(vlm_config))
+        self.to_bfloat16_for_selected_params(precision)
+
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+        _set_precision(self, precision)
+
+    def embed_image(self, image: torch.Tensor):
+        return self.paligemma.model.get_image_features(image)
+
+    def embed_language_tokens(self, tokens: torch.Tensor):
+        return self.paligemma.language_model.embed_tokens(tokens)
+
+    def decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Returns the logits over the vocabulary (tied input embeddings)."""
+        weight = self.paligemma.language_model.embed_tokens.weight
+        return torch.matmul(hidden_states.to(weight.dtype), weight.T).to(torch.float32)
+
+    def forward(self, inputs_embeds, attention_mask, position_ids):
+        return self.paligemma.language_model.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+        ).last_hidden_state
+
+
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -15,29 +98,17 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        *,
+        knowledge_insulation: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
+        # Knowledge insulation: when both experts are run together, the queries of the action expert only see
+        # detached keys and values of the backbone, so that the action expert loss does not update the backbone.
+        self.knowledge_insulation = knowledge_insulation
 
-        vlm_config_hf = CONFIG_MAPPING["paligemma"]()
-        vlm_config_hf._vocab_size = 257152  # noqa: SLF001
-        vlm_config_hf.image_token_index = 257152
-        vlm_config_hf.text_config.hidden_size = vlm_config.width
-        vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
-        vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
-        vlm_config_hf.text_config.head_dim = vlm_config.head_dim
-        vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
-        vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
-        vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        vlm_config_hf.text_config.torch_dtype = "float32"
-        vlm_config_hf.text_config.vocab_size = 257152
-        vlm_config_hf.text_config.use_adarms = use_adarms[0]
-        vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
-        vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
-        vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_config_hf.vision_config.torch_dtype = "float32"
+        vlm_config_hf = make_paligemma_config(vlm_config, use_adarms=use_adarms[0])
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -60,32 +131,18 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.to_bfloat16_for_selected_params(precision)
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
-        if precision == "bfloat16":
-            self.to(dtype=torch.bfloat16)
-        elif precision == "float32":
-            self.to(dtype=torch.float32)
-            return
-        else:
-            raise ValueError(f"Invalid precision: {precision}")
-
-        params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
-            "input_layernorm",
-            "post_attention_layernorm",
-            "model.norm",
-        ]
-
-        for name, param in self.named_parameters():
-            if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
+        _set_precision(self, precision)
 
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
+
+    def decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Returns the logits over the vocabulary (tied input embeddings)."""
+        weight = self.paligemma.language_model.embed_tokens.weight
+        return torch.matmul(hidden_states.to(weight.dtype), weight.T).to(torch.float32)
 
     def forward(
         self,
@@ -197,14 +254,27 @@ class PaliGemmaWithExpertModel(nn.Module):
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
                 # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                attn_module = self.paligemma.language_model.layers[layer_idx].self_attn
+                if self.knowledge_insulation:
+                    n = inputs_embeds[0].shape[1]
+                    insulated_keys = torch.cat([key_states[:, :, :n].detach(), key_states[:, :, n:]], dim=2)
+                    insulated_values = torch.cat([value_states[:, :, :n].detach(), value_states[:, :, n:]], dim=2)
+                    prefix_output, _ = modeling_gemma.eager_attention_forward(
+                        attn_module, query_states[:, :, :n], key_states, value_states, attention_mask[:, :, :n], scaling
+                    )
+                    suffix_output, _ = modeling_gemma.eager_attention_forward(
+                        attn_module,
+                        query_states[:, :, n:],
+                        insulated_keys,
+                        insulated_values,
+                        attention_mask[:, :, n:],
+                        scaling,
+                    )
+                    att_output = torch.cat([prefix_output, suffix_output], dim=1)
+                else:
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        attn_module, query_states, key_states, value_states, attention_mask, scaling
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)

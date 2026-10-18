@@ -11,6 +11,8 @@ penalty at the end, consistent with the returns used to train the value function
 `positive_fraction` of frames with the largest advantage within each task, and always positive for frames inside
 intervention segments (human corrections).
 
+Works with JAX (`scripts/train.py`) and PyTorch (`scripts/train_pytorch.py`) value function checkpoints.
+
 Usage:
     uv run scripts/compute_advantages.py --config-name <value_config> \
         --checkpoint-dir checkpoints/<value_config>/<exp_name>/<step> --output advantages.npz
@@ -46,8 +48,20 @@ def compute_values(
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
     data_config = dataclasses.replace(data_config, norm_stats=norm_stats)
 
-    model = config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    predict_value = nnx_utils.module_jit(model.predict_value)
+    weight_path = checkpoint_dir / "model.safetensors"
+    if weight_path.exists():
+        # PyTorch checkpoint (scripts/train_pytorch.py).
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = config.model.load_pytorch(config, str(weight_path)).to(device).eval()
+
+        def predict_value(observation):
+            return model.predict_value(jax.tree.map(lambda x: x.to(device), observation)).cpu()
+
+        to_array = torch.as_tensor
+    else:
+        model = config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        predict_value = nnx_utils.module_jit(model.predict_value)
+        to_array = jnp.asarray
 
     dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
     dataset = _data_loader.transform_dataset(dataset, data_config)
@@ -63,7 +77,7 @@ def compute_values(
 
     values = []
     for batch in tqdm.tqdm(loader, desc="Computing values"):
-        observation = _model.Observation.from_dict(jax.tree.map(jnp.asarray, batch))
+        observation = _model.Observation.from_dict(jax.tree.map(to_array, batch))
         values.append(np.asarray(predict_value(observation), dtype=np.float32))
     return np.concatenate(values)
 

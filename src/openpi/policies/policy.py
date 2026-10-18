@@ -85,14 +85,23 @@ class Policy(BasePolicy):
         # (e.g. the actions of the previous chunk that are executed while this one is computed). They went through the
         # same transforms as the training actions.
         action_prefix = inputs.pop("actions", None)
-        if action_prefix is not None and getattr(self._model, "rtc_max_delay", 0) > 0 and not self._is_pytorch_model:
-            action_horizon = self._model.action_horizon
-            prefix_len = min(action_prefix.shape[1], action_horizon)
-            action_prefix = jnp.pad(
-                action_prefix[:, :action_horizon], ((0, 0), (0, action_horizon - prefix_len), (0, 0))
-            )
+        if action_prefix is not None and getattr(self._model, "rtc_max_delay", 0) > 0:
+            if self._is_pytorch_model:
+                action_horizon = self._model.config.action_horizon
+                prefix_len = min(action_prefix.shape[1], action_horizon)
+                action_prefix = torch.nn.functional.pad(
+                    action_prefix[:, :action_horizon].to(torch.float32), (0, 0, 0, action_horizon - prefix_len)
+                )
+                prefix_lens = torch.full((action_prefix.shape[0],), prefix_len, device=action_prefix.device)
+            else:
+                action_horizon = self._model.action_horizon
+                prefix_len = min(action_prefix.shape[1], action_horizon)
+                action_prefix = jnp.pad(
+                    action_prefix[:, :action_horizon], ((0, 0), (0, action_horizon - prefix_len), (0, 0))
+                )
+                prefix_lens = jnp.full((action_prefix.shape[0],), prefix_len, dtype=jnp.int32)
             sample_kwargs["action_prefix"] = action_prefix
-            sample_kwargs["action_prefix_len"] = jnp.full((action_prefix.shape[0],), prefix_len, dtype=jnp.int32)
+            sample_kwargs["action_prefix_len"] = prefix_lens
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
