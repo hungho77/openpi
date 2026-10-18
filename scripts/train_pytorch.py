@@ -190,6 +190,16 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
+        # As for JAX, keep only the latest checkpoint and the ones at multiples of keep_period
+        for ckpt_dir in config.checkpoint_dir.iterdir():
+            if not ckpt_dir.is_dir() or not ckpt_dir.name.isdigit():
+                continue
+            step = int(ckpt_dir.name)
+            if step == global_step or (config.keep_period is not None and step % config.keep_period == 0):
+                continue
+            shutil.rmtree(ckpt_dir)
+            logging.info(f"Removed old checkpoint {ckpt_dir}")
+
         # Log checkpoint to wandb
         if config.wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)

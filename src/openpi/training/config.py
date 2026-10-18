@@ -1045,6 +1045,7 @@ _CONFIGS = [
         pytorch_training_precision="bfloat16",
         num_train_steps=30_000,
         save_interval=2_000,
+        keep_period=10_000,
     ),
     # RECAP, step 1: value function on the SO101 data. Episodes without a "success" label count as successful.
     TrainConfig(
@@ -1073,6 +1074,7 @@ _CONFIGS = [
         pytorch_training_precision="bfloat16",
         num_train_steps=10_000,
         save_interval=2_000,
+        keep_period=10_000,
     ),
     # RECAP, step 2, with memory and subgoal images: uses the advantages of `value_so101_left`.
     TrainConfig(
@@ -1116,6 +1118,7 @@ _CONFIGS = [
         pytorch_training_precision="bfloat16",
         num_train_steps=30_000,
         save_interval=2_000,
+        keep_period=10_000,
     ),
     # High-level policy. Needs subtask segments in an annotations file (see docs/episode_metadata.md).
     TrainConfig(
@@ -1143,6 +1146,7 @@ _CONFIGS = [
         pytorch_training_precision="bfloat16",
         num_train_steps=10_000,
         save_interval=2_000,
+        keep_period=10_000,
     ),
     #
     # Fine-tuning Aloha configs.
