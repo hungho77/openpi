@@ -16,6 +16,7 @@ The configs are the same as for JAX, but some config fields work differently in 
 |---|---|
 | `pytorch_weight_path` | The initial weights, a converted PyTorch checkpoint. This replaces `weight_loader`. |
 | `pytorch_training_precision` | Use `"bfloat16"` (the default) or `"float32"`. |
+| `pytorch_gradient_accumulation_steps` | Accumulates the gradients of this many batches before each optimizer step, for a larger effective batch than fits in memory. |
 | LoRA, `freeze_filter`, EMA | Not supported. PyTorch always does a full fine-tune. |
 | `fsdp_devices` | Not supported. Each GPU holds a full copy of the model (DDP). |
 

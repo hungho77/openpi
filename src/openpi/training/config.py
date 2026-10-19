@@ -545,6 +545,10 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # PyTorch training: number of batches whose gradients are accumulated before each optimizer step. The effective
+    # batch size is batch_size * pytorch_gradient_accumulation_steps, and each training step consumes that many batches.
+    pytorch_gradient_accumulation_steps: int = 1
+
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
@@ -1046,6 +1050,45 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=2_000,
         keep_period=10_000,
+    ),
+    # Same model as pi05_so101_left with an effective batch size of 128 (16 x 8 accumulated batches), which sees about
+    # the same number of samples as the GR00T runs on this data (6k steps x 128). The 30k-step run with batch 16 was
+    # still improving in the open-loop evaluation when it ended.
+    TrainConfig(
+        name="pi05_so101_left_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            max_token_len=250,
+            rtc_max_delay=6,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            # Reuses the norm stats of pi05_so101_left.
+            assets=AssetsConfig(assets_dir="./assets/pi05_so101_left", asset_id="hungho77/so101-left-arm-multitask"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=50, target_speed=300, target_quality=None, target_mistake=None
+                ),
+            ),
+        ),
+        batch_size=16,
+        pytorch_gradient_accumulation_steps=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=5e-5,
+            decay_steps=6_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=6_000,
+        save_interval=1_000,
+        keep_period=2_000,
     ),
     # RECAP, step 1: value function on the SO101 data. Episodes without a "success" label count as successful.
     TrainConfig(

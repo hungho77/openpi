@@ -23,6 +23,7 @@ Multi-Node Training:
 
 """
 
+import contextlib
 import dataclasses
 import gc
 import logging
@@ -485,7 +486,8 @@ def train_loop(config: _config.TrainConfig):
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
         )
         logging.info(
-            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
+            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, "
+            f"gradient_accumulation_steps={config.pytorch_gradient_accumulation_steps}, num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
@@ -504,10 +506,14 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    accumulation_steps = config.pytorch_gradient_accumulation_steps
+    micro_step = 0
+    accumulated_loss = 0.0
+
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
+            loader.set_epoch(global_step * accumulation_steps // len(loader))
 
         for observation, actions in loader:
             # Check if we've reached the target number of steps
@@ -523,18 +529,27 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            # Only synchronize the gradients between processes on the last accumulated batch.
+            last_micro_step = micro_step == accumulation_steps - 1
+            sync_context = contextlib.nullcontext() if (last_micro_step or not use_ddp) else model.no_sync()
+            with sync_context:
+                # Forward pass
+                losses = model(observation, actions)
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
-
-            # Backward pass
-            loss.backward()
+                # Backward pass
+                (losses.mean() / accumulation_steps).backward()
+            accumulated_loss += losses.mean().item() / accumulation_steps
+            if not last_micro_step:
+                micro_step += 1
+                continue
+            loss_value = accumulated_loss
+            micro_step = 0
+            accumulated_loss = 0.0
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
@@ -557,7 +572,7 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": loss_value,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
@@ -606,7 +621,7 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {"loss": f"{loss_value:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
 
     # Close progress bar
