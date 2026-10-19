@@ -1051,9 +1051,10 @@ _CONFIGS = [
         save_interval=2_000,
         keep_period=10_000,
     ),
-    # Same model as pi05_so101_left with an effective batch size of 128 (16 x 8 accumulated batches), which sees about
+    # Same model as pi05_so101_left with an effective batch size of 128 (8 x 16 accumulated batches), which sees about
     # the same number of samples as the GR00T runs on this data (6k steps x 128). The 30k-step run with batch 16 was
-    # still improving in the open-loop evaluation when it ended.
+    # still improving in the open-loop evaluation when it ended. The accumulated gradients take extra memory, so on
+    # 2 x 40 GB GPUs each batch has 4 samples per GPU (8 per GPU runs out of memory).
     TrainConfig(
         name="pi05_so101_left_v2",
         model=pi0_config.Pi0Config(
@@ -1074,8 +1075,8 @@ _CONFIGS = [
                 ),
             ),
         ),
-        batch_size=16,
-        pytorch_gradient_accumulation_steps=8,
+        batch_size=8,
+        pytorch_gradient_accumulation_steps=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=300,
             peak_lr=5e-5,
