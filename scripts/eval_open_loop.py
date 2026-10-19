@@ -44,7 +44,9 @@ def _plot(path: pathlib.Path, pred: np.ndarray, gt: np.ndarray, action_horizon: 
     plt.close(fig)
 
 
-def evaluate_episode(policy, dataset, prepare, episode: int, action_horizon: int, steps: int) -> dict[str, np.ndarray]:
+def evaluate_episode(
+    policy, dataset, prepare, episode: int, action_horizon: int, steps: int, speed: str = "episode"
+) -> dict[str, np.ndarray]:
     start = int(dataset.episode_data_index["from"][episode])
     end = int(dataset.episode_data_index["to"][episode])
     length = min(end - start, steps)
@@ -55,6 +57,11 @@ def evaluate_episode(policy, dataset, prepare, episode: int, action_horizon: int
         obs = prepare(dataset[start + step])
         # The recorded actions would be used as the real-time chunking prefix.
         obs.pop("actions", None)
+        if speed == "episode":
+            # Prompt with the speed of the recorded episode, so that the predictions can match its timing.
+            obs["speed"] = end - start
+        elif speed == "none":
+            obs["speed"] = None
         chunk = np.asarray(policy.infer(obs)["actions"])
         pred.append(chunk[: min(action_horizon, length - step)])
     pred = np.concatenate(pred)[:, : gt.shape[-1]]
@@ -73,7 +80,16 @@ def main(
     steps: int = 400,
     device: str | None = None,
     plot: bool = True,
+    speed: str = "episode",
 ) -> None:
+    """Runs the open-loop evaluation.
+
+    Args:
+        speed: Speed in the prompt of models trained with episode metadata. "episode" uses the length of the
+            evaluated episode, "target" the `target_speed` of the config, and "none" leaves the speed out.
+    """
+    if speed not in ("episode", "target", "none"):
+        raise ValueError(f"Unknown speed mode: {speed}")
     logging.basicConfig(level=logging.INFO, force=True)
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -89,7 +105,7 @@ def main(
     out.mkdir(parents=True, exist_ok=True)
     results = {}
     for episode in tqdm.tqdm(episodes, desc="Episodes"):
-        r = evaluate_episode(policy, dataset, prepare, episode, action_horizon, steps)
+        r = evaluate_episode(policy, dataset, prepare, episode, action_horizon, steps, speed)
         np.savez(out / f"episode_{episode}.npz", **r)
         results[episode] = {
             "steps": len(r["gt"]),
@@ -112,6 +128,7 @@ def main(
         "checkpoint": str(checkpoint_dir),
         "action_horizon": action_horizon,
         "steps": steps,
+        "speed": speed,
         "episodes": results,
         "mean": summary,
     }
