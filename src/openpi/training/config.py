@@ -1091,6 +1091,80 @@ _CONFIGS = [
         save_interval=1_000,
         keep_period=2_000,
     ),
+    # pi05_so101_left_v2 trained twice as long. The open-loop error of v2 was still falling at its last checkpoint.
+    TrainConfig(
+        name="pi05_so101_left_v3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            max_token_len=250,
+            rtc_max_delay=6,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            assets=AssetsConfig(assets_dir="./assets/pi05_so101_left", asset_id="hungho77/so101-left-arm-multitask"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=50, target_speed=300, target_quality=None, target_mistake=None
+                ),
+            ),
+        ),
+        batch_size=8,
+        pytorch_gradient_accumulation_steps=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=5e-5,
+            decay_steps=12_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=12_000,
+        save_interval=2_000,
+        keep_period=4_000,
+    ),
+    # pi05_so101_left_v3 with memory: each camera also gets the frames from 1 s and 2 s ago.
+    TrainConfig(
+        name="pi05_so101_left_v3_memory",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            max_token_len=250,
+            rtc_max_delay=6,
+            history_frames=2,
+            history_stride_s=1.0,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            assets=AssetsConfig(assets_dir="./assets/pi05_so101_left", asset_id="hungho77/so101-left-arm-multitask"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=50, target_speed=300, target_quality=None, target_mistake=None
+                ),
+            ),
+        ),
+        batch_size=8,
+        pytorch_gradient_accumulation_steps=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=5e-5,
+            decay_steps=12_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=12_000,
+        save_interval=2_000,
+        keep_period=4_000,
+    ),
     # RECAP, step 1: value function on the SO101 data. Episodes without a "success" label count as successful.
     TrainConfig(
         name="value_so101_left",

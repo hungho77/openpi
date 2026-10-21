@@ -44,8 +44,23 @@ def _plot(path: pathlib.Path, pred: np.ndarray, gt: np.ndarray, action_horizon: 
     plt.close(fig)
 
 
+def _history(dataset, prepare, start: int, index: int, history_frames: int, stride: int) -> list[dict]:
+    """Returns the past frames of `index` (oldest first) for models with memory. Frames before the episode start are
+    left out, so that the model masks them as in training."""
+    past = [index - i * stride for i in range(history_frames, 0, -1)]
+    return [{k: v for k, v in prepare(dataset[p]).items() if "image" in k} for p in past if p >= start]
+
+
 def evaluate_episode(
-    policy, dataset, prepare, episode: int, action_horizon: int, steps: int, speed: str = "episode"
+    policy,
+    dataset,
+    prepare,
+    episode: int,
+    action_horizon: int,
+    steps: int,
+    speed: str = "episode",
+    history_frames: int = 0,
+    history_stride: int = 0,
 ) -> dict[str, np.ndarray]:
     start = int(dataset.episode_data_index["from"][episode])
     end = int(dataset.episode_data_index["to"][episode])
@@ -57,6 +72,8 @@ def evaluate_episode(
         obs = prepare(dataset[start + step])
         # The recorded actions would be used as the real-time chunking prefix.
         obs.pop("actions", None)
+        if history_frames > 0:
+            obs["history"] = _history(dataset, prepare, start, start + step, history_frames, history_stride)
         if speed == "episode":
             # Prompt with the speed of the recorded episode, so that the predictions can match its timing.
             obs["speed"] = end - start
@@ -101,11 +118,16 @@ def main(
         [_transforms.PromptFromLeRobotTask(meta.tasks), *data_config.repack_transforms.inputs]
     )
 
+    history_frames = getattr(config.model, "history_frames", 0)
+    history_stride = round(getattr(config.model, "history_stride_s", 0.0) * meta.fps)
+
     out = pathlib.Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     results = {}
     for episode in tqdm.tqdm(episodes, desc="Episodes"):
-        r = evaluate_episode(policy, dataset, prepare, episode, action_horizon, steps, speed)
+        r = evaluate_episode(
+            policy, dataset, prepare, episode, action_horizon, steps, speed, history_frames, history_stride
+        )
         np.savez(out / f"episode_{episode}.npz", **r)
         results[episode] = {
             "steps": len(r["gt"]),
