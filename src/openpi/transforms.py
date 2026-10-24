@@ -214,7 +214,9 @@ class DeltaActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        # Copy: the same actions array is shared by the shallow copies that SubgoalInputs / HistoryInputs pass to their
+        # frame transforms, so an in-place update would apply the shift once per frame.
+        state, actions = data["state"], np.array(data["actions"], copy=True)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -236,7 +238,9 @@ class AbsoluteActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        # Copy: the same actions array is shared by the shallow copies that SubgoalInputs / HistoryInputs pass to their
+        # frame transforms, so an in-place update would apply the shift once per frame.
+        state, actions = data["state"], np.array(data["actions"], copy=True)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
