@@ -316,3 +316,17 @@ def test_history_inputs():
     transform = _transforms.HistoryInputs(_to_model_images, _to_model_images, num_frames=3, dropout=1.0)
     data = transform({**obs, "history": history})
     assert not data["history_image_mask"]["base_0_rgb"].any()
+
+
+def test_history_inputs_keep_delta_actions():
+    # The frame transforms see the same actions array as the observation; they must not shift it again.
+    delta = _transforms.DeltaActions(_transforms.make_bool_mask(2))
+    cams = {"cam": np.zeros((2, 2, 3), np.uint8), "wrist": np.zeros((2, 2, 3), np.uint8)}
+    obs = {**cams, "state": np.array([1.0, 2.0]), "actions": np.array([[3.0, 3.0]])}
+
+    def inputs(data):
+        data = delta(data)
+        return {**_to_model_images(data), "actions": data["actions"]}
+
+    data = _transforms.HistoryInputs(inputs, inputs, num_frames=2)({**obs, "history": [dict(cams), dict(cams)]})
+    np.testing.assert_allclose(data["actions"], [[2.0, 1.0]])
