@@ -872,6 +872,27 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
     ),
+    #
+    # SO101 LEFT arm, 3 new tasks (red cube pot -> hollow cube, drawer + red block, drawer + stack),
+    # merged by examples/so101/convert_merge_task3.py. Same recipe as the 80GB run of
+    # pi05_so101_leftarm_multitask (run_so101_leftarm_80gb.sh): batch 128, 6_000 steps, cosine decayed
+    # over the run, no EMA (PyTorch trainer). 159 episodes / 133,763 frames, so 768_000 samples is
+    # 5.7 epochs.
+    TrainConfig(
+        name="pi05_so101_leftarm_task3",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSO101DataConfig(
+            # HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_task3_v21
+            repo_id="hungho77/so101-left-arm-task3",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_train_steps=6_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+    ),
     TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
