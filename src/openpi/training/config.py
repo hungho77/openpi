@@ -804,6 +804,95 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+    #
+    # SO101 single-arm multitask (hungho77/so101-multitask), PyTorch finetune.
+    #
+    # Modelled on pi05_aloha_pen_uncap, which is openpi's own example of finetuning
+    # pi05_base on a small custom LeRobot dataset. Everything not listed here is left at
+    # the TrainConfig / Pi0Config / CosineDecaySchedule / AdamW defaults on purpose.
+    TrainConfig(
+        name="pi05_so101",
+        # Default action_horizon (50), like pi05_aloha_pen_uncap. pi05_base was pretrained
+        # at this horizon; only pi05_libero overrides it, to match LIBERO's short chunks.
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSO101DataConfig(
+            # The Hub copy is LeRobot v3.0, but openpi pins lerobot from 2025-05-28 which
+            # only reads v2.1. Point HF_LEROBOT_HOME at the converted v2.1 tree so this
+            # repo_id resolves locally:
+            #   HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_multitask_v21
+            repo_id="hungho77/so101-multitask",
+            # prompt_from_task turns the dataset's task_index into the language prompt,
+            # which is what makes this one checkpoint cover all three tasks.
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_train_steps=6_000,
+        # EMA is listed as unsupported by the PyTorch trainer, so it has to be off here
+        # even though the openpi default is 0.99. This is the one forced deviation.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+    ),
+    #
+    # SO101 LEFT arm, 11-task multitask (hungho77/SO101_LeftArmOnly_Task collection merged).
+    #
+    # Same robot layout as pi05_so101 above — 5 arm joints + gripper, cameras `top` and
+    # `wrist` — so LeRobotSO101DataConfig and so101_policy are reused unchanged. What
+    # differs is scale: 551 episodes and 253,745 frames across 11 tasks, 3.8x the
+    # right-arm set, which is why the step count and LR schedule below are not simply
+    # copied from it.
+    TrainConfig(
+        name="pi05_so101_leftarm_multitask",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSO101DataConfig(
+            # Resolved under HF_LEROBOT_HOME, which must point at the merged v2.1 tree:
+            #   HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_multitask_v21
+            repo_id="hungho77/so101-left-arm-multitask",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        # 32 is the ceiling, measured, not chosen: this trains under DDP on two MIG
+        # 3g.40gb slices, DDP replicates the optimizer on every rank (openpi's PyTorch
+        # trainer has no FSDP), and the fixed cost of weights + grads + AdamW state is
+        # ~29GB of the 39.5GB slice. Measured reserved memory: bs 32 -> 35.3GB,
+        # bs 48 -> 38.4GB, bs 64 -> OOM. There is also no gradient accumulation in the
+        # PyTorch trainer, so this is the effective batch, not a per-device one.
+        # openpi's own pi05_droid_finetune runs at 32 as well.
+        batch_size=32,
+        # 24_000 x 32 = 768_000 samples, the same sample budget as the right-arm run
+        # (6_000 x 128), which keeps the two checkpoints comparable. In epochs it is only
+        # 3.0 against that run's 11.4, because this dataset is 3.8x larger.
+        num_train_steps=24_000,
+        # decay_steps tied to num_train_steps, unlike the default 30_000. On the right-arm
+        # run that default against 6_000 steps left the LR at 94% of peak the whole way —
+        # the cosine never actually decayed, and the loss was still falling when training
+        # stopped. Overriding the schedule is how other configs in this file handle it.
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=24_000),
+        # EMA is unsupported by the PyTorch trainer.
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+    ),
+    #
+    # SO101 LEFT arm, 3 new tasks (red cube pot -> hollow cube, drawer + red block, drawer + stack),
+    # merged by examples/so101/convert_merge_task3.py. Same recipe as the 80GB run of
+    # pi05_so101_leftarm_multitask (run_so101_leftarm_80gb.sh): batch 128, 6_000 steps, cosine decayed
+    # over the run, no EMA (PyTorch trainer). 159 episodes / 133,763 frames, so 768_000 samples is
+    # 5.7 epochs.
+    TrainConfig(
+        name="pi05_so101_leftarm_task3",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSO101DataConfig(
+            # HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_task3_v21
+            repo_id="hungho77/so101-left-arm-task3",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_train_steps=6_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+    ),
     TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
