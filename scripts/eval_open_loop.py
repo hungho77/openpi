@@ -61,6 +61,7 @@ def evaluate_episode(
     speed: str = "episode",
     history_frames: int = 0,
     history_stride: int = 0,
+    advantage: str = "none",
 ) -> dict[str, np.ndarray]:
     start = int(dataset.episode_data_index["from"][episode])
     end = int(dataset.episode_data_index["to"][episode])
@@ -79,6 +80,8 @@ def evaluate_episode(
             obs["speed"] = end - start
         elif speed == "none":
             obs["speed"] = None
+        if advantage != "none":
+            obs["advantage"] = advantage == "positive"
         chunk = np.asarray(policy.infer(obs)["actions"])
         pred.append(chunk[: min(action_horizon, length - step)])
     pred = np.concatenate(pred)[:, : gt.shape[-1]]
@@ -98,15 +101,20 @@ def main(
     device: str | None = None,
     plot: bool = True,
     speed: str = "episode",
+    advantage: str = "none",
 ) -> None:
     """Runs the open-loop evaluation.
 
     Args:
         speed: Speed in the prompt of models trained with episode metadata. "episode" uses the length of the
             evaluated episode, "target" the `target_speed` of the config, and "none" leaves the speed out.
+        advantage: RECAP advantage indicator in the prompt of models trained with advantages: "positive",
+            "negative", or "none" to leave it out.
     """
     if speed not in ("episode", "target", "none"):
         raise ValueError(f"Unknown speed mode: {speed}")
+    if advantage not in ("positive", "negative", "none"):
+        raise ValueError(f"Unknown advantage mode: {advantage}")
     logging.basicConfig(level=logging.INFO, force=True)
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -126,7 +134,7 @@ def main(
     results = {}
     for episode in tqdm.tqdm(episodes, desc="Episodes"):
         r = evaluate_episode(
-            policy, dataset, prepare, episode, action_horizon, steps, speed, history_frames, history_stride
+            policy, dataset, prepare, episode, action_horizon, steps, speed, history_frames, history_stride, advantage
         )
         np.savez(out / f"episode_{episode}.npz", **r)
         results[episode] = {
@@ -151,6 +159,7 @@ def main(
         "action_horizon": action_horizon,
         "steps": steps,
         "speed": speed,
+        "advantage": advantage,
         "episodes": results,
         "mean": summary,
     }

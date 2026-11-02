@@ -1260,6 +1260,7 @@ _CONFIGS = [
         model=value_model.ValueConfig(),
         data=LeRobotSO101DataConfig(
             repo_id="hungho77/so101-left-arm-multitask",
+            assets=AssetsConfig(assets_dir="./assets/pi05_so101_left", asset_id="hungho77/so101-left-arm-multitask"),
             base_config=DataConfig(
                 prompt_from_task=True,
                 value_target=_episode_metadata.ValueTargetConfig(annotations_path=None, default_success=True),
@@ -1326,6 +1327,50 @@ _CONFIGS = [
         num_train_steps=30_000,
         save_interval=2_000,
         keep_period=10_000,
+    ),
+    # pi05_so101_left_recap with the batch, steps and learning rate of pi05_so101_left_v3_memory, so the two runs only
+    # differ by the subgoal images and the advantage indicator.
+    TrainConfig(
+        name="pi05_so101_left_recap_v3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            max_token_len=250,
+            rtc_max_delay=6,
+            history_frames=2,
+            history_stride_s=1.0,
+            knowledge_insulation=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="hungho77/so101-left-arm-multitask",
+            assets=AssetsConfig(assets_dir="./assets/pi05_so101_left", asset_id="hungho77/so101-left-arm-multitask"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episode_metadata=_episode_metadata.EpisodeMetadataConfig(
+                    speed_bin_size=50,
+                    target_speed=300,
+                    target_quality=None,
+                    target_mistake=None,
+                    advantages_path="./assets/value_so101_left/advantages.npz",
+                ),
+                subgoal=_episode_metadata.SubgoalConfig(views=("base_0_rgb",)),
+            ),
+        ),
+        batch_size=16,
+        pytorch_gradient_accumulation_steps=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=5e-5,
+            decay_steps=12_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=12_000,
+        save_interval=2_000,
+        keep_period=4_000,
     ),
     # High-level policy. Needs subtask segments in an annotations file (see docs/episode_metadata.md).
     TrainConfig(
