@@ -245,7 +245,9 @@ def test_subgoal_inputs():
 
     data = transform({**obs, "subgoal": goal})
     assert np.all(data["subgoal_image"]["base_0_rgb"] == 1)
-    assert data["subgoal_image_mask"] == {"base_0_rgb": True, "left_wrist_0_rgb": False}
+    # The views outside `views` are left out.
+    assert data["subgoal_image_mask"] == {"base_0_rgb": True}
+    assert list(data["subgoal_image"]) == ["base_0_rgb"]
     assert np.all(data["image"]["base_0_rgb"] == 0)
 
     # Without a subgoal, nothing is added at inference time and empty subgoals are added for training.
@@ -254,6 +256,8 @@ def test_subgoal_inputs():
     data = transform(dict(obs))
     assert not any(data["subgoal_image_mask"].values())
     assert data["subgoal_image"]["base_0_rgb"].shape == (2, 2, 3)
+    transform = _transforms.SubgoalInputs(_to_model_images, _to_model_images, views=("base_0_rgb",), always_add=True)
+    assert list(transform(dict(obs))["subgoal_image"]) == ["base_0_rgb"]
 
 
 class _FakeFAST:

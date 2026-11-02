@@ -603,7 +603,8 @@ class SubgoalInputs(DataTransformFn):
 
     transform: DataTransformFn
     subgoal_transform: DataTransformFn
-    # Restricts the subgoal to these model image keys, e.g. ("base_0_rgb",). The other views are masked out.
+    # Restricts the subgoal to these model image keys, e.g. ("base_0_rgb",). The other views are left out, so the model
+    # does not embed images that would be fully masked.
     views: Sequence[str] | None = None
     # If true, empty (fully masked) subgoal images are added when there is no subgoal, so that all examples have the
     # same structure. Required for training.
@@ -619,13 +620,14 @@ class SubgoalInputs(DataTransformFn):
         if subgoal is not None:
             images = subgoal_inputs["image"]
             masks = {key: np.asarray(subgoal_inputs["image_mask"][key]) for key in images}
-            if self.views is not None:
-                masks = {key: mask & (key in self.views) for key, mask in masks.items()}
         elif self.always_add:
             images = {key: np.zeros_like(image) for key, image in outputs["image"].items()}
             masks = dict.fromkeys(images, np.False_)
         else:
             return outputs
+        if self.views is not None:
+            images = {key: image for key, image in images.items() if key in self.views}
+            masks = {key: masks[key] for key in images}
         return {**outputs, "subgoal_image": images, "subgoal_image_mask": masks}
 
 
