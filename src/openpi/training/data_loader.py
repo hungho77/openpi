@@ -246,6 +246,48 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class SO101StoreDataset(Dataset):
+    """Frames of the SO101 store in LeRobot sample layout: top and wrist images (uint8 HWC, already letterboxed to
+    224), 6-dim state, an absolute action chunk that repeats the episode's last action past its end, and the task."""
+
+    def __init__(self, store_dir: str, action_horizon: int, episodes: Sequence[int] = ()):
+        import json
+        import pathlib
+
+        import pandas as pd
+
+        root = pathlib.Path(store_dir)
+        self._root = root
+        self._top = self._wrist = None  # opened lazily: a pickled memmap is a full in-memory copy per worker
+        meta = pd.read_parquet(root / "meta.parquet", columns=["episode_index", "state", "action"])
+        self._prompt = json.loads((root / "store.json").read_text())["prompt"]
+        self._state = np.stack(meta["state"].to_numpy()).astype(np.float32)
+        self._action = np.stack(meta["action"].to_numpy()).astype(np.float32)
+        episode = meta["episode_index"].to_numpy()
+        last = pd.Series(np.arange(len(meta))).groupby(episode).transform("max").to_numpy()
+        self._chunk = np.minimum(np.arange(len(meta))[:, None] + np.arange(action_horizon)[None], last[:, None])
+        self._indices = np.flatnonzero(np.isin(episode, episodes)) if episodes else np.arange(len(meta))
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        i = self._indices[index.__index__()]
+        if self._top is None:
+            self._top = np.load(self._root / "full.npy", mmap_mode="r")
+            self._wrist = np.load(self._root / "wrist.npy", mmap_mode="r")
+        return {
+            "observation.images.top": np.asarray(self._top[i]),
+            "observation.images.wrist": np.asarray(self._wrist[i]),
+            "observation.state": self._state[i],
+            "action": self._action[self._chunk[i]],
+            "prompt": self._prompt,
+        }
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getstate__(self) -> dict:
+        return self.__dict__ | {"_top": None, "_wrist": None}
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -255,6 +297,8 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if data_config.so101_store_dir is not None:
+        return SO101StoreDataset(data_config.so101_store_dir, action_horizon, data_config.so101_store_episodes)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     delta_timestamps = {

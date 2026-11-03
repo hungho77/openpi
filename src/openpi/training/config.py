@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -111,6 +112,11 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # SO101 store written by FoveaVLA's examples/so101/build_store.py (letterboxed 224x224 frames). When set, it is
+    # read instead of the LeRobot dataset, so the baselines see exactly the frames FoveaVLA sees.
+    so101_store_dir: str | None = None
+    so101_store_episodes: tuple[int, ...] = ()
 
 
 class GroupFactory(Protocol):
@@ -380,6 +386,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 class LeRobotSO101DataConfig(DataConfigFactory):
     """Single SO101 arm with a top and a wrist camera, recorded with LeRobot (absolute joint position actions)."""
 
+    # False drops the wrist camera (its slot is zeroed and masked), for the top-camera-only baseline.
+    use_wrist: bool = True
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -396,7 +405,7 @@ class LeRobotSO101DataConfig(DataConfigFactory):
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[so101_policy.SO101Inputs(model_type=model_config.model_type)],
+            inputs=[so101_policy.SO101Inputs(model_type=model_config.model_type, use_wrist=self.use_wrist)],
             outputs=[so101_policy.SO101Outputs()],
         )
         # The 5 arm joints are trained as deltas, the gripper stays absolute.
@@ -893,6 +902,39 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
     ),
+    # π0.5 baselines for the FoveaVLA reproduction on hungho77/so101-left_arm_task_drawer_placing_red_squre_block.
+    # They read the FoveaVLA SO101 store built by FoveaVLA's examples/so101/build_store.py (same letterboxed frames,
+    # same 49 train episodes; set SO101_DRAWER_STORE to its directory) and copy the foveavla_so101_single recipe:
+    # JAX trainer, horizon 16, batch 32, 20k steps, 1k warmup to a constant 5e-5, EMA 0.99. A uses top + wrist
+    # cameras (the paper's wrist-equipped π0.5); B uses the top camera only.
+    *[
+        TrainConfig(
+            name=name,
+            model=pi0_config.Pi0Config(pi05=True, action_horizon=16),
+            data=LeRobotSO101DataConfig(
+                repo_id="so101_drawer_store",
+                use_wrist=use_wrist,
+                base_config=DataConfig(
+                    so101_store_dir=os.environ.get(
+                        "SO101_DRAWER_STORE",
+                        "/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_drawer_red_block_v30/foveavla_store",
+                    ),
+                    # All 57 episodes except the held-out (2, 15, 17, 28, 34, 44) and 5, 24 (gripper never moves).
+                    so101_store_episodes=tuple(e for e in range(57) if e not in (2, 15, 17, 28, 34, 44, 5, 24)),
+                ),
+            ),
+            batch_size=32,
+            num_train_steps=20_000,
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+            ),
+            ema_decay=0.99,
+            save_interval=2000,
+            keep_period=5000,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        )
+        for name, use_wrist in (("pi05_so101_drawer_top_wrist", True), ("pi05_so101_drawer_top", False))
+    ],
     TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
