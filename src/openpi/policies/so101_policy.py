@@ -38,10 +38,12 @@ class SO101Inputs(transforms.DataTransformFn):
     """
 
     model_type: _model.ModelType
+    # False zeroes and masks the wrist slot, for a top-camera-only policy.
+    use_wrist: bool = True
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(data["observation/wrist_image"])
+        wrist_image = _parse_image(data["observation/wrist_image"]) if self.use_wrist else np.zeros_like(base_image)
 
         inputs = {
             "state": np.asarray(data["observation/state"]),
@@ -53,7 +55,7 @@ class SO101Inputs(transforms.DataTransformFn):
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.bool_(self.use_wrist),
                 # Padding images are only masked for pi0 models, not pi0-FAST style models.
                 "right_wrist_0_rgb": np.True_
                 if self.model_type in (_model.ModelType.PI0_FAST, _model.ModelType.SUBTASK)
