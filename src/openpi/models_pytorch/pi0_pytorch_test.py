@@ -115,6 +115,36 @@ def test_knowledge_insulation():
     assert backbone > 0.0
 
 
+def test_rtc_delay_and_prefix_noise():
+    model = factory.create_model(_config(rtc_max_delay=3))
+    delay = model.sample_rtc_delay(10_000, "cpu")
+    assert delay.min() == 0
+    assert delay.max() == 3
+    assert 0.2 < (delay == 0).float().mean() < 0.3  # 1/4
+
+    model = factory.create_model(_config(rtc_max_delay=3, rtc_zero_delay_prob=0.5))
+    assert 0.58 < (model.sample_rtc_delay(10_000, "cpu") == 0).float().mean() < 0.67  # 0.5 + 0.5/4
+    model = factory.create_model(_config(rtc_max_delay=3, rtc_zero_delay_prob=1.0))
+    assert (model.sample_rtc_delay(100, "cpu") == 0).all()
+
+    # Noise on the committed actions changes the inputs, so the loss changes too.
+    obs = _observation()
+    actions = torch.randn(BATCH_SIZE, 4, 32)
+    noise, time = torch.randn_like(actions), torch.full((BATCH_SIZE,), 0.5)
+    losses = []
+    for prefix_noise in (0.0, 0.5):
+        model = _perturb(factory.create_model(_config(rtc_max_delay=3, rtc_zero_delay_prob=0.0, rtc_prefix_noise=0.0)))
+        model.rtc_prefix_noise = prefix_noise
+        model.sample_rtc_delay = lambda bsize, device: torch.full((bsize,), 2, device=device)
+        torch.manual_seed(2)
+        with torch.no_grad():
+            losses.append(model(obs, actions, noise=noise, time=time))
+    # The committed actions are excluded from the loss either way.
+    assert (losses[0][:, :2] == 0).all()
+    assert (losses[1][:, :2] == 0).all()
+    assert not torch.allclose(losses[0][:, 2:], losses[1][:, 2:])
+
+
 def test_sample_actions():
     config = _config(rtc_max_delay=2, history_frames=2)
     model = factory.create_model(config).eval()

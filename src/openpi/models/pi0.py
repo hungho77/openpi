@@ -91,6 +91,8 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.rtc_max_delay = config.rtc_max_delay
+        self.rtc_zero_delay_prob = config.rtc_zero_delay_prob
+        self.rtc_prefix_noise = config.rtc_prefix_noise
         self.knowledge_insulation = config.knowledge_insulation
         self.ki_max_fast_tokens = config.ki_max_fast_tokens
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -291,8 +293,14 @@ class Pi0(_model.BaseModel):
         loss_weights = None
         if self.rtc_max_delay > 0:
             delay = jax.random.randint(jax.random.fold_in(rng, 1), batch_shape, 0, self.rtc_max_delay + 1)
+            if self.rtc_zero_delay_prob > 0:
+                zero = jax.random.uniform(jax.random.fold_in(rng, 2), batch_shape) < self.rtc_zero_delay_prob
+                delay = jnp.where(zero, 0, delay)
             committed = jnp.arange(self.action_horizon) < delay[..., None]
-            x_t = jnp.where(committed[..., None], actions, x_t)
+            prefix = actions
+            if self.rtc_prefix_noise > 0:
+                prefix = actions + self.rtc_prefix_noise * jax.random.normal(jax.random.fold_in(rng, 3), actions.shape)
+            x_t = jnp.where(committed[..., None], prefix, x_t)
             action_time = jnp.where(committed, 0.0, time[..., None])
             # normalize so that the mean over the chunk is the mean over the predicted actions
             loss_weights = ~committed * (self.action_horizon / jnp.maximum(self.action_horizon - delay, 1))[..., None]

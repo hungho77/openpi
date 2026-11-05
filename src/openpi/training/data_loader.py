@@ -64,6 +64,20 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class SubsetDataset(Dataset):
+    """The examples of `dataset` at `indices`."""
+
+    def __init__(self, dataset: Dataset, indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = np.asarray(indices)
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        return self._dataset[int(self._indices[index.__index__()])]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
 class SubgoalDataset(Dataset):
     """Adds a future frame of the same episode as the subgoal ("subgoal" key) to a fraction of the examples."""
 
@@ -352,6 +366,15 @@ def create_torch_dataset(
             episode_lengths=_episode_metadata.get_episode_lengths(dataset_meta),
             segments={index: episode.get("segments", ()) for index, episode in annotations.items()},
         )
+
+    if data_config.exclude_episodes:
+        # Filtered here rather than with LeRobotDataset(episodes=...), whose episode_data_index is then indexed by the
+        # position of an episode in the subset but looked up by its episode index. The wrappers above index the full
+        # dataset, so the subset is the outermost one.
+        episode_index = np.asarray(
+            lerobot_ds.hf_dataset.select_columns(["episode_index"]).with_format("numpy")["episode_index"]
+        )
+        dataset = SubsetDataset(dataset, np.flatnonzero(~np.isin(episode_index, data_config.exclude_episodes)))
 
     return dataset
 

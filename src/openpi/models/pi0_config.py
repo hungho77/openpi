@@ -37,6 +37,13 @@ class Pi0Config(_model.BaseModelConfig):
     # the loss. At inference time, the actions that will be executed while the next chunk is being computed can then
     # be passed as an action prefix, which gives smooth transitions between chunks. 0 disables it.
     rtc_max_delay: int = 0
+    # Probability that an example gets no committed actions (delay 0) before the uniform sampling above. With the
+    # uniform sampling alone, an example has no prefix only 1 / (rtc_max_delay + 1) of the time, so the first actions
+    # of a chunk are rarely trained without one.
+    rtc_zero_delay_prob: float = 0.0
+    # Standard deviation of the Gaussian noise added to the committed actions during training (normalized action
+    # space), so that the model learns to correct a prefix that disagrees with the observation instead of following it.
+    rtc_prefix_noise: float = 0.0
 
     # Memory: number of past frames per camera, sampled every `history_stride_s` seconds. The past frames are encoded
     # with the same vision encoder and compressed into the tokens of the current frame (the number of tokens does not

@@ -94,6 +94,8 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # Episodes of the LeRobot dataset that are left out of training (e.g. held out for evaluation).
+    exclude_episodes: tuple[int, ...] = ()
     # If set, the prompt will be extended with the episode metadata (speed, quality, mistake) and the current subtask.
     # Only supported for LeRobot datasets. The repack transforms must keep the "prompt" key.
     episode_metadata: _episode_metadata.EpisodeMetadataConfig | None = None
@@ -629,6 +631,15 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# Episodes of hungho77/so101-left-arm-task3 held out of the pi05_so101_task3_* runs: 6 per task (task 0 is episodes
+# 0-50, task 1 51-107, task 2 108-158), spread over each task and leaving out the 6 trajectories (0, 25, 51, 80, 108,
+# 133) of the open-loop evaluation of the earlier task3 runs, so that those stay comparable.
+SO101_TASK3_HELDOUT = (5, 13, 21, 33, 41, 47, 56, 66, 75, 88, 97, 104, 113, 121, 129, 140, 148, 155)
+# Training-time RTC for the 3-task set: up to 6 committed steps (200 ms at 30 fps). On the 11-task set, the uniform
+# delay left only 1 in 7 examples without a prefix, and the model was weaker without one and followed a wrong prefix
+# instead of the observation, so half of the examples get no prefix and the committed actions get noise.
+_SO101_TASK3_RTC = {"rtc_max_delay": 6, "rtc_zero_delay_prob": 0.5, "rtc_prefix_noise": 0.03}
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -902,6 +913,43 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
     ),
+    # Ablation of the π0.7 features on the 3-task set, each run on top of the previous one (PyTorch, one H100):
+    #   p1: the pi05_so101_leftarm_task3 recipe with 6 episodes per task held out;
+    #   p2: + training-time RTC, with half of the examples without a prefix and noise on the committed actions;
+    #   p3: + knowledge insulation;
+    #   p4: + memory (2 past frames, 1 s apart).
+    # All use the normalization statistics of pi05_so101_leftarm_task3 (computed on all 159 episodes) and batch 32 with
+    # 4 accumulation steps (128 per step) for 6,000 steps.
+    *[
+        TrainConfig(
+            name=f"pi05_so101_task3_{name}",
+            model=pi0_config.Pi0Config(pi05=True, **model_kwargs),
+            data=LeRobotSO101DataConfig(
+                # HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_task3_v21
+                repo_id="hungho77/so101-left-arm-task3",
+                assets=AssetsConfig(assets_dir="./assets/pi05_so101_task3", asset_id="hungho77/so101-left-arm-task3"),
+                base_config=DataConfig(prompt_from_task=True, exclude_episodes=SO101_TASK3_HELDOUT),
+            ),
+            batch_size=32,
+            pytorch_gradient_accumulation_steps=4,
+            num_train_steps=6_000,
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+            ema_decay=None,
+            pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+            pytorch_training_precision="bfloat16",
+            save_interval=2_000,
+            keep_period=2_000,
+        )
+        for name, model_kwargs in [
+            ("p1", {}),
+            ("p2", _SO101_TASK3_RTC),
+            ("p3", {**_SO101_TASK3_RTC, "knowledge_insulation": True, "max_token_len": 250}),
+            (
+                "p4",
+                {**_SO101_TASK3_RTC, "knowledge_insulation": True, "max_token_len": 250, "history_frames": 2},
+            ),
+        ]
+    ],
     # π0.5 baselines for the FoveaVLA reproduction on hungho77/so101-left_arm_task_drawer_placing_red_squre_block.
     # They read the FoveaVLA SO101 store built by FoveaVLA's examples/so101/build_store.py (same letterboxed frames,
     # same 49 train episodes; set SO101_DRAWER_STORE to its directory) and copy the foveavla_so101_single recipe:

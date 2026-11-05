@@ -62,6 +62,8 @@ def evaluate_episode(
     history_frames: int = 0,
     history_stride: int = 0,
     advantage: str = "none",
+    prefix: int = 0,
+    prefix_source: str = "gt",
 ) -> dict[str, np.ndarray]:
     start = int(dataset.episode_data_index["from"][episode])
     end = int(dataset.episode_data_index["to"][episode])
@@ -69,10 +71,15 @@ def evaluate_episode(
     gt = np.stack([np.asarray(a) for a in dataset.hf_dataset.select(range(start, start + length))["action"]])
 
     pred = []
+    prev_chunk = None
     for step in range(0, length, action_horizon):
         obs = prepare(dataset[start + step])
-        # The recorded actions would be used as the real-time chunking prefix.
+        # The recorded actions are not given to the policy, except as a real-time chunking prefix (see `main`).
         obs.pop("actions", None)
+        if prefix > 0 and prefix_source == "gt":
+            obs["actions"] = gt[step : step + prefix]
+        elif prefix > 0 and prev_chunk is not None:
+            obs["actions"] = prev_chunk[action_horizon : action_horizon + prefix]
         if history_frames > 0:
             obs["history"] = _history(dataset, prepare, start, start + step, history_frames, history_stride)
         if speed == "episode":
@@ -83,6 +90,7 @@ def evaluate_episode(
         if advantage != "none":
             obs["advantage"] = advantage == "positive"
         chunk = np.asarray(policy.infer(obs)["actions"])
+        prev_chunk = chunk
         pred.append(chunk[: min(action_horizon, length - step)])
     pred = np.concatenate(pred)[:, : gt.shape[-1]]
     # Baseline: repeat the recorded action at the start of each chunk.
@@ -102,6 +110,8 @@ def main(
     plot: bool = True,
     speed: str = "episode",
     advantage: str = "none",
+    prefix: int = 0,
+    prefix_source: str = "self",
 ) -> None:
     """Runs the open-loop evaluation.
 
@@ -110,11 +120,18 @@ def main(
             evaluated episode, "target" the `target_speed` of the config, and "none" leaves the speed out.
         advantage: RECAP advantage indicator in the prompt of models trained with advantages: "positive",
             "negative", or "none" to leave it out.
+        prefix: Number of committed actions given as the real-time chunking prefix of models trained with
+            `rtc_max_delay` > 0 (0 = none).
+        prefix_source: "self" takes them from the policy's previous chunk, as on the robot (no prefix for the first
+            chunk of an episode); "gt" takes the recorded actions. In open loop the observations do not follow the
+            policy's actions, so with "self" its errors accumulate along the episode.
     """
     if speed not in ("episode", "target", "none"):
         raise ValueError(f"Unknown speed mode: {speed}")
     if advantage not in ("positive", "negative", "none"):
         raise ValueError(f"Unknown advantage mode: {advantage}")
+    if prefix_source not in ("self", "gt"):
+        raise ValueError(f"Unknown prefix source: {prefix_source}")
     logging.basicConfig(level=logging.INFO, force=True)
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -134,7 +151,18 @@ def main(
     results = {}
     for episode in tqdm.tqdm(episodes, desc="Episodes"):
         r = evaluate_episode(
-            policy, dataset, prepare, episode, action_horizon, steps, speed, history_frames, history_stride, advantage
+            policy,
+            dataset,
+            prepare,
+            episode,
+            action_horizon,
+            steps,
+            speed,
+            history_frames,
+            history_stride,
+            advantage,
+            prefix,
+            prefix_source,
         )
         np.savez(out / f"episode_{episode}.npz", **r)
         results[episode] = {
@@ -160,6 +188,8 @@ def main(
         "steps": steps,
         "speed": speed,
         "advantage": advantage,
+        "prefix": prefix,
+        "prefix_source": prefix_source,
         "episodes": results,
         "mean": summary,
     }

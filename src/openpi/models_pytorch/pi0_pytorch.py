@@ -215,6 +215,8 @@ class PI0Pytorch(PrefixEmbeddingMixin, nn.Module):
         self.config = config
         self.pi05 = config.pi05
         self.rtc_max_delay = getattr(config, "rtc_max_delay", 0)
+        self.rtc_zero_delay_prob = getattr(config, "rtc_zero_delay_prob", 0.0)
+        self.rtc_prefix_noise = getattr(config, "rtc_prefix_noise", 0.0)
         self.history_frames = getattr(config, "history_frames", 0)
         self.knowledge_insulation = getattr(config, "knowledge_insulation", False)
         self.ki_max_fast_tokens = getattr(config, "ki_max_fast_tokens", 128)
@@ -314,6 +316,15 @@ class PI0Pytorch(PrefixEmbeddingMixin, nn.Module):
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
+
+    def sample_rtc_delay(self, bsize, device):
+        """Number of committed actions per example: 0 with probability `rtc_zero_delay_prob`, otherwise uniform in
+        [0, rtc_max_delay]."""
+        delay = torch.randint(0, self.rtc_max_delay + 1, (bsize,), device=device)
+        if self.rtc_zero_delay_prob > 0:
+            zero = torch.rand(bsize, device=device) < self.rtc_zero_delay_prob
+            delay = torch.where(zero, torch.zeros_like(delay), delay)
+        return delay
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -438,9 +449,12 @@ class PI0Pytorch(PrefixEmbeddingMixin, nn.Module):
         action_time = time
         loss_weights = None
         if self.rtc_max_delay > 0:
-            delay = torch.randint(0, self.rtc_max_delay + 1, (bsize,), device=actions.device)
+            delay = self.sample_rtc_delay(bsize, actions.device)
             committed = torch.arange(action_horizon, device=actions.device)[None, :] < delay[:, None]
-            x_t = torch.where(committed[..., None], actions, x_t)
+            prefix = actions
+            if self.rtc_prefix_noise > 0:
+                prefix = actions + self.rtc_prefix_noise * torch.randn_like(actions)
+            x_t = torch.where(committed[..., None], prefix, x_t)
             action_time = torch.where(committed, torch.zeros_like(x_t[..., 0]), time[:, None])
             # normalize so that the mean over the chunk is the mean over the predicted actions
             loss_weights = (~committed).to(torch.float32) * (action_horizon / (action_horizon - delay).clamp(min=1))[
