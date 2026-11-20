@@ -916,6 +916,8 @@ _CONFIGS = [
     # Ablation of the π0.7 features on the 3-task set, each run on top of the previous one (PyTorch, one H100):
     #   p1: the pi05_so101_leftarm_task3 recipe with 6 episodes per task held out;
     #   p2: + training-time RTC, with half of the examples without a prefix and noise on the committed actions;
+    #   p2b: p2 with prefix noise 0.15 instead of 0.03 (best variant: level with p1 without a prefix, and the least
+    #        drift with its own previous chunk as prefix);
     #   p3: + knowledge insulation;
     #   p4: + memory (2 past frames, 1 s apart).
     # All use the normalization statistics of pi05_so101_leftarm_task3 (computed on all 159 episodes) and batch 32 with
@@ -943,6 +945,7 @@ _CONFIGS = [
         for name, model_kwargs in [
             ("p1", {}),
             ("p2", _SO101_TASK3_RTC),
+            ("p2b", {**_SO101_TASK3_RTC, "rtc_prefix_noise": 0.15}),
             ("p3", {**_SO101_TASK3_RTC, "knowledge_insulation": True, "max_token_len": 250}),
             (
                 "p4",
