@@ -265,6 +265,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
+    # Only used with adapt_to_pi: if false, the joints are flipped but the gripper is passed through unchanged (see
+    # aloha_policy.AlohaInputs.adapt_gripper_to_pi).
+    adapt_gripper_to_pi: bool = True
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -286,8 +289,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            inputs=[
+                aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi, adapt_gripper_to_pi=self.adapt_gripper_to_pi)
+            ],
+            outputs=[
+                aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, adapt_gripper_to_pi=self.adapt_gripper_to_pi)
+            ],
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
@@ -390,6 +397,11 @@ class LeRobotSO101DataConfig(DataConfigFactory):
 
     # False drops the wrist camera (its slot is zeroed and masked), for the top-camera-only baseline.
     use_wrist: bool = True
+    # Other single arms with the same layout (arm joints as deltas, then one absolute gripper) reuse this config:
+    # number of arm joints (5 for SO101, 6 for one ALOHA arm) and the dataset keys of the top and wrist cameras.
+    arm_joints: int = 5
+    top_image_key: str = "observation.images.top"
+    wrist_image_key: str = "observation.images.wrist"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -397,8 +409,8 @@ class LeRobotSO101DataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "observation.images.top",
-                        "observation/wrist_image": "observation.images.wrist",
+                        "observation/image": self.top_image_key,
+                        "observation/wrist_image": self.wrist_image_key,
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
@@ -408,10 +420,10 @@ class LeRobotSO101DataConfig(DataConfigFactory):
         )
         data_transforms = _transforms.Group(
             inputs=[so101_policy.SO101Inputs(model_type=model_config.model_type, use_wrist=self.use_wrist)],
-            outputs=[so101_policy.SO101Outputs()],
+            outputs=[so101_policy.SO101Outputs(action_dim=self.arm_joints + 1)],
         )
-        # The 5 arm joints are trained as deltas, the gripper stays absolute.
-        delta_action_mask = _transforms.make_bool_mask(5, -1)
+        # The arm joints are trained as deltas, the gripper stays absolute.
+        delta_action_mask = _transforms.make_bool_mask(self.arm_joints, -1)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -953,6 +965,79 @@ _CONFIGS = [
             ),
         ]
     ],
+    # ALOHA left hand, 3 tasks (cover_and_stack, sort_blocks, store_block), merged by
+    # examples/aloha_left_hand/merge_aloha_left_hand.py: 249 episodes / 63,190 frames at 15 fps, all used for training.
+    # 14-dim state/action in the standard Interbotix joint convention (radians), so the joints are flipped into the
+    # pi convention (adapt_to_pi). The gripper is NOT converted: it is recorded as an angle (~0.6 closed .. 1.66 open,
+    # already the range of pi's angular gripper space), while the standard Aloha conversion assumes a normalized linear
+    # position and would saturate every value above 1.0. Delta joints, absolute grippers. Horizon 16 = 1.07 s at
+    # 15 fps (openpi's ALOHA default is 50 steps = 1 s at 50 Hz). Recipe of pi05_so101_task3_p1: 32 x 4 accumulation,
+    # 6,000 steps, cosine 2.5e-5 with 1,000 warmup, bf16.
+    TrainConfig(
+        name="pi05_aloha_left_hand_3task",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16),
+        data=LeRobotAlohaDataConfig(
+            # HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/aloha_left_hand_merged_v21
+            repo_id="hungho77/aloha-left-hand-3task",
+            adapt_to_pi=True,
+            adapt_gripper_to_pi=False,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.color.high",
+                                "cam_left_wrist": "observation.images.color.wrist_left",
+                                "cam_right_wrist": "observation.images.color.wrist_right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        pytorch_gradient_accumulation_steps=4,
+        num_train_steps=6_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+        ema_decay=None,
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_workers=7,
+        save_interval=2_000,
+        keep_period=None,
+    ),
+    # Same set as a SINGLE arm (user decision 2026-11-26, replaces pi05_aloha_left_hand_3task): the idle right arm and
+    # its wrist camera are removed by examples/aloha_left_hand/build_left_view.py, so state/action are the 7 left dims
+    # (6 joints + gripper). Single-arm pipeline of the SO101 runs (not the bimanual ALOHA one): base = high camera,
+    # left wrist slot = wrist_left, right wrist slot empty; delta joints, absolute gripper; the Interbotix joint
+    # convention and the angular gripper are kept as recorded (no adapt_to_pi: the flip only exists to match pi's
+    # bimanual ALOHA runtime; the quantile normalization absorbs scale/offset). Same recipe as before.
+    TrainConfig(
+        name="pi05_aloha_left_hand_3task_left",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16),
+        data=LeRobotSO101DataConfig(
+            # HF_LEROBOT_HOME=/mnt/data/sftp/data/hunght23/DATA_ZOO/aloha_left_hand_merged_v21_left
+            repo_id="hungho77/aloha-left-hand-3task",
+            arm_joints=6,
+            top_image_key="observation.images.color.high",
+            wrist_image_key="observation.images.color.wrist_left",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        pytorch_gradient_accumulation_steps=4,
+        num_train_steps=6_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+        ema_decay=None,
+        pytorch_weight_path="/mnt/data/sftp/data/hunght23/MODEL_ZOO/openpi/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_workers=7,
+        save_interval=2_000,
+        keep_period=None,
+    ),
     # π0.5 baselines for the FoveaVLA reproduction on hungho77/so101-left_arm_task_drawer_placing_red_squre_block.
     # They read the FoveaVLA SO101 store built by FoveaVLA's examples/so101/build_store.py (same letterboxed frames,
     # same 49 train episodes; set SO101_DRAWER_STORE to its directory) and copy the foveavla_so101_single recipe:

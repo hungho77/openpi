@@ -34,13 +34,17 @@ class AlohaInputs(transforms.DataTransformFn):
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
+    # Only used with adapt_to_pi. If false, only the joints are flipped and the gripper values are passed through
+    # unchanged: for data whose gripper is already an angle (larger = open), not the normalized linear position the
+    # standard Aloha runtime records. The normalization statistics absorb the remaining affine difference.
+    adapt_gripper_to_pi: bool = True
 
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
 
     def __call__(self, data: dict) -> dict:
-        data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
+        data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi, adapt_gripper=self.adapt_gripper_to_pi)
 
         in_images = data["images"]
         if set(in_images) - set(self.EXPECTED_CAMERAS):
@@ -78,7 +82,7 @@ class AlohaInputs(transforms.DataTransformFn):
         # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])
-            actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
+            actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi, adapt_gripper=self.adapt_gripper_to_pi)
             inputs["actions"] = actions
 
         if "prompt" in data:
@@ -94,11 +98,15 @@ class AlohaOutputs(transforms.DataTransformFn):
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
+    # See AlohaInputs.adapt_gripper_to_pi.
+    adapt_gripper_to_pi: bool = True
 
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
         actions = np.asarray(data["actions"][:, :14])
-        return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
+        return {
+            "actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi, adapt_gripper=self.adapt_gripper_to_pi)
+        }
 
 
 def _joint_flip_mask() -> np.ndarray:
@@ -156,11 +164,11 @@ def _gripper_from_angular_inv(value):
     return value - 0.5476
 
 
-def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
+def _decode_aloha(data: dict, *, adapt_to_pi: bool = False, adapt_gripper: bool = True) -> dict:
     # state is [left_arm_joint_angles, left_arm_gripper, right_arm_joint_angles, right_arm_gripper]
     # dim sizes: [6, 1, 6, 1]
     state = np.asarray(data["state"])
-    state = _decode_state(state, adapt_to_pi=adapt_to_pi)
+    state = _decode_state(state, adapt_to_pi=adapt_to_pi, adapt_gripper=adapt_gripper)
 
     def convert_image(img):
         img = np.asarray(img)
@@ -178,25 +186,28 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
     return data
 
 
-def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False, adapt_gripper: bool = True) -> np.ndarray:
     if adapt_to_pi:
         # Flip the joints.
         state = _joint_flip_mask() * state
+    if adapt_to_pi and adapt_gripper:
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         state[[6, 13]] = _gripper_to_angular(state[[6, 13]])
     return state
 
 
-def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False, adapt_gripper: bool = True) -> np.ndarray:
     if adapt_to_pi:
         # Flip the joints.
         actions = _joint_flip_mask() * actions
-        actions[:, [6, 13]] = _gripper_from_angular(actions[:, [6, 13]])
+        if adapt_gripper:
+            actions[:, [6, 13]] = _gripper_from_angular(actions[:, [6, 13]])
     return actions
 
 
-def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
+def _encode_actions_inv(actions: np.ndarray, *, adapt_to_pi: bool = False, adapt_gripper: bool = True) -> np.ndarray:
     if adapt_to_pi:
         actions = _joint_flip_mask() * actions
-        actions[:, [6, 13]] = _gripper_from_angular_inv(actions[:, [6, 13]])
+        if adapt_gripper:
+            actions[:, [6, 13]] = _gripper_from_angular_inv(actions[:, [6, 13]])
     return actions

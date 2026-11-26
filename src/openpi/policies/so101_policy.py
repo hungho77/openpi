@@ -75,5 +75,8 @@ class SO101Inputs(transforms.DataTransformFn):
 class SO101Outputs(transforms.DataTransformFn):
     """Returns the 6 SO101 action dimensions (the model actions are padded)."""
 
+    # Number of real action dims; other single arms reuse these transforms (e.g. 7 for one ALOHA arm: 6 joints + gripper).
+    action_dim: int = ACTION_DIM
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][..., :ACTION_DIM])}
+        return {"actions": np.asarray(data["actions"][..., : self.action_dim])}
